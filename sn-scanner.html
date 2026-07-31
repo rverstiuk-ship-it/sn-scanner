@@ -45,11 +45,12 @@
   /* ---- Камера ---- */
   .stage{position:relative;border:1px solid var(--line);background:#000;overflow:hidden;aspect-ratio:3/4}
   .stage video{width:100%;height:100%;object-fit:cover;display:block}
-  .reticle{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);height:19%;pointer-events:none}
-  /* межі тихої зони: штрихкод мусить вміститися між пунктирами */
-  .reticle u{position:absolute;top:-8px;bottom:-8px;width:0;border-left:2px dashed var(--hazard);opacity:.95}
-  .reticle u:nth-of-type(1){left:8%}
-  .reticle u:nth-of-type(2){left:92%}
+  /* висота відповідає реальній зоні захвату трьох смуг */
+  .reticle{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);height:65%;pointer-events:none}
+  /* мінімальна ширина: штрихкод має бути ШИРШИМ за пунктири */
+  .reticle u{position:absolute;top:0;bottom:0;width:0;border-left:2px dashed var(--hazard);opacity:.85}
+  .reticle u:nth-of-type(1){left:30%}
+  .reticle u:nth-of-type(2){left:70%}
   .gauge{position:absolute;top:10px;left:10px;font-size:11px;font-weight:800;letter-spacing:.14em;
     text-transform:uppercase;padding:5px 9px;opacity:0;transition:opacity .2s}
   .gauge.near{opacity:1;background:var(--hazard);color:#fff}
@@ -64,7 +65,6 @@
   .reticle i:nth-child(2){top:0;right:0;border-left:0;border-bottom:0}
   .reticle i:nth-child(3){bottom:0;left:0;border-right:0;border-top:0}
   .reticle i:nth-child(4){bottom:0;right:0;border-left:0;border-top:0}
-  .reticle b{position:absolute;top:50%;left:10px;right:10px;height:1px;background:var(--hazard);opacity:.75}
   .stage-hint{position:absolute;left:0;right:0;bottom:0;padding:8px 12px;font-size:11.5px;letter-spacing:.04em;
     color:var(--paper);background:linear-gradient(transparent,rgba(0,0,0,.8))}
   .stage-off{position:absolute;inset:0;display:grid;place-content:center;gap:14px;text-align:center;padding:24px;background:var(--panel-2)}
@@ -140,10 +140,10 @@
 
   <div class="stage" id="stage">
     <video id="vid" playsinline muted autoplay></video>
-    <div class="reticle" hidden id="reticle"><i></i><i></i><i></i><i></i><b></b><u></u><u></u></div>
+    <div class="reticle" hidden id="reticle"><i></i><i></i><i></i><i></i><u></u><u></u></div>
     <div class="live" hidden id="live"><b></b>сканую</div>
     <div class="gauge" id="gauge"></div>
-    <div class="stage-hint" hidden id="hint">Штрихкод S/N — від пунктира до пунктира, не торкаючись країв кадру</div>
+    <div class="stage-hint" hidden id="hint">Штрихкод S/N — усередині рамки, ширший за пунктири, не торкаючись боків</div>
     <div class="stage-off" id="off">
       <p>Камера вимкнена.<br>Сторінка має бути відкрита по HTTPS.</p>
       <button class="primary" id="start">Увімкнути камеру</button>
@@ -207,12 +207,14 @@
 "use strict";
 
 /* ============================================================
-   Формат серійника DJI (перевірено на партії з 50 коробок):
-     1581F7K3C + 4 символи + "00" + D + 4 символи  =  20 символів
-   Літери O в серійниках НЕ БУВАЄ НІКОЛИ — тільки цифра 0.
+   Правило серійника: префікс 1581 + разом 20 символів [0-9A-Z].
+   Структуру (F7K3C…00D…) свідомо не перевіряємо: Code 128 має
+   власну контрольну суму, тому успішне декодування вже гарантує
+   правильність рядка. Зайва строгість лише відкидала б валідні
+   серійники інших моделей DJI.
+   Літери O в серійниках не буває — тільки цифра 0.
    ============================================================ */
-const RE_STRICT = /^1581F7K3C[0-9A-Z]{4}00D[0-9A-Z]{4}$/;
-const RE_LOOSE  = /^1581[0-9A-Z]{16}$/;
+const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
 
 const state = {
   serials: new Map(),   // serial -> {seq, ts, src, flag}
@@ -280,8 +282,7 @@ function normalize(raw){
 }
 function classify(raw){
   const { s, hadO } = normalize(raw);
-  if (RE_STRICT.test(s)) return { s, ok:true,  flag: hadO ? 'була літера O → виправлено на 0' : '' };
-  if (RE_LOOSE.test(s))  return { s, ok:true,  flag: 'нестандартний формат — перевір' };
+  if (RE_SERIAL.test(s)) return { s, ok:true, flag: hadO ? 'була літера O → виправлено на 0' : '' };
   return { s, ok:false, flag:'' };
 }
 
@@ -497,24 +498,24 @@ function stopCamera(){
   els.start.textContent = 'Увімкнути камеру';
 }
 
-/* Рамка на екрані = 88% ширини, 26% висоти по центру.
-   Ті самі частки вирізаємо з нативного кадру. */
-/* Смуга на всю ширину кадру: S/N — найдовший штрихкод на етикетці,
-   будь-яке обрізання по краях робить його недекодованим (Code128 потребує
-   тиху зону >= 10 модулів з обох боків). Пунктирні лінії на екрані
-   показують, де штрихкод має закінчитися, щоб ця зона лишилась. */
-const ROI = { x:0, y:0.405, w:1, h:0.19 };
+/* Скануємо ТРИ смуги по висоті кадру по черзі (по одній на кадр).
+   Одна вузька смуга по центру вимагала надто точного наведення —
+   етикетка часто опиняється вище або нижче. Ширина завжди повна:
+   S/N — найдовший штрихкод, будь-яке обрізання по краях його вбиває. */
+const ROI_BANDS = [0.35, 0.50, 0.65];   // центри смуг у частках висоти кадру
+const ROI_H = 0.19;
 
-function grabRoi(scale){
+function grabRoi(scale, bandIdx){
   const vw = els.vid.videoWidth, vh = els.vid.videoHeight;
   if (!vw || !vh) return null;
-  const sx = Math.round(vw*ROI.x), sy = Math.round(vh*ROI.y);
-  const sw = Math.round(vw*ROI.w), sh = Math.round(vh*ROI.h);
-  work.width  = Math.round(sw*scale);
+  const cy = ROI_BANDS[bandIdx % ROI_BANDS.length];
+  const sy = Math.round(vh*(cy - ROI_H/2));
+  const sh = Math.round(vh*ROI_H);
+  work.width  = Math.round(vw*scale);
   work.height = Math.round(sh*scale);
   wctx.imageSmoothingEnabled = false;
-  wctx.drawImage(els.vid, sx, sy, sw, sh, 0, 0, work.width, work.height);
-  lastRoi = sw+'×'+sh + (scale!==1?(' ×'+scale):'');
+  wctx.drawImage(els.vid, 0, sy, vw, sh, 0, 0, work.width, work.height);
+  lastRoi = vw+'×'+sh + ' смуга '+(bandIdx % ROI_BANDS.length + 1) + (scale!==1?(' ×'+scale):'');
   return work;
 }
 
@@ -545,12 +546,13 @@ async function loop(){
   state.frames++; tick++;
 
   let res = null;
-  const c1 = grabRoi(1);
+  const band = tick % ROI_BANDS.length;
+  const c1 = grabRoi(1, band);
   if (c1) res = await decodeCanvas(c1);
 
-  // кожен третій кадр — ще спроба з апскейлом (допомагає, коли смуги надто дрібні)
-  if (!res && tick % 3 === 0){
-    const c2 = grabRoi(2);
+  // рідше — важча спроба з апскейлом по центральній смузі
+  if (!res && tick % 6 === 0){
+    const c2 = grabRoi(2, 1);
     if (c2) res = await decodeCanvas(c2);
   }
 
