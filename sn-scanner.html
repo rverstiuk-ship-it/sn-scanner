@@ -50,6 +50,10 @@
   .reticle u{position:absolute;top:-8px;bottom:-8px;width:0;border-left:2px dashed var(--hazard);opacity:.95}
   .reticle u:nth-of-type(1){left:8%}
   .reticle u:nth-of-type(2){left:92%}
+  .gauge{position:absolute;top:10px;left:10px;font-size:11px;font-weight:800;letter-spacing:.14em;
+    text-transform:uppercase;padding:5px 9px;opacity:0;transition:opacity .2s}
+  .gauge.near{opacity:1;background:var(--hazard);color:#fff}
+  .gauge.good{opacity:1;background:var(--kraft);color:var(--ink)}
   .live{position:absolute;top:10px;right:10px;display:flex;align-items:center;gap:6px;font-size:10.5px;
     letter-spacing:.14em;text-transform:uppercase;color:var(--paper);text-shadow:0 1px 3px #000}
   .live b{width:8px;height:8px;border-radius:50%;background:var(--hazard);animation:pulse 1.1s infinite}
@@ -138,7 +142,8 @@
     <video id="vid" playsinline muted autoplay></video>
     <div class="reticle" hidden id="reticle"><i></i><i></i><i></i><i></i><b></b><u></u><u></u></div>
     <div class="live" hidden id="live"><b></b>сканую</div>
-    <div class="stage-hint" hidden id="hint">Штрихкод S/N має вміститися <b>між пунктирами</b> — з білим полем по краях</div>
+    <div class="gauge" id="gauge"></div>
+    <div class="stage-hint" hidden id="hint">Штрихкод S/N — від пунктира до пунктира, не торкаючись країв кадру</div>
     <div class="stage-off" id="off">
       <p>Камера вимкнена.<br>Сторінка має бути відкрита по HTTPS.</p>
       <button class="primary" id="start">Увімкнути камеру</button>
@@ -219,7 +224,7 @@ const state = {
 
 const $ = id => document.getElementById(id);
 const els = {
-  vid:$('vid'), stage:$('stage'), off:$('off'), reticle:$('reticle'), hint:$('hint'), live:$('live'),
+  vid:$('vid'), stage:$('stage'), off:$('off'), reticle:$('reticle'), hint:$('hint'), live:$('live'), gauge:$('gauge'),
   start:$('start'), stop:$('stop'), torch:$('torch'),
   last:$('last'), lastTag:$('lastTag'), readout:$('readout'),
   items:$('items'), emptyNote:$('emptyNote'), cnt:$('cnt'), target:$('target'), fill:$('fill'),
@@ -400,7 +405,13 @@ function zxingDecode(canvas){
     const src = new ZXing.RGBLuminanceSource(lum, w, h);
     const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
     const res = zxingReader.decode(bmp);
-    return res ? res.getText() : null;
+    if (!res) return null;
+    let width = 0;
+    try{
+      const pts = res.getResultPoints().map(p=>p.getX());
+      width = Math.max(...pts) - Math.min(...pts);
+    }catch(e){}
+    return { text: res.getText(), width: width };
   }catch(e){ return null; }
   finally{ try{ zxingReader.reset(); }catch(e){} }
 }
@@ -409,7 +420,9 @@ async function decodeCanvas(canvas){
   if (nativeDetector){
     try{
       const found = await nativeDetector.detect(canvas);
-      for (const b of found){ if (b.rawValue) return b.rawValue; }
+      for (const b of found){
+        if (b.rawValue) return { text:b.rawValue, width:(b.boundingBox? b.boundingBox.width : 0) };
+      }
     }catch(e){}
   }
   return zxingDecode(canvas);
@@ -478,6 +491,7 @@ function stopCamera(){
   els.reticle.hidden = true;
   els.hint.hidden = true;
   els.live.hidden = true;
+  els.gauge.className = 'gauge';
   els.stop.disabled = els.torch.disabled = true;
   els.off.querySelector('p').textContent = 'Камера вимкнена.';
   els.start.textContent = 'Увімкнути камеру';
@@ -504,24 +518,50 @@ function grabRoi(scale){
   return work;
 }
 
+/* Date Code (16 симв = 211 модулів) декодується легко навіть здалеку,
+   тому використовуємо його як далекомір: за його шириною рахуємо, скільки
+   пікселів на модуль буде у S/N (20 симв = 255 модулів, така ж друкована
+   ширина). Менше 2.4 — треба підійти ближче. */
+function gauge(res){
+  if (!res || !res.width) return;
+  const t = res.text || '';
+  let modules = null;
+  if (/^CP[0-9A-Z]{14}$/.test(t)) modules = 211;      // Date Code
+  else if (t.startsWith('1581')) modules = 255;       // сам S/N
+  if (!modules) return;
+  // перерахунок на щільність S/N
+  const pxPerModuleSN = (res.width / modules) * (modules / 255);
+  if (pxPerModuleSN < 2.4){
+    els.gauge.textContent = 'ближче';
+    els.gauge.className = 'gauge near';
+  } else {
+    els.gauge.textContent = 'відстань добра';
+    els.gauge.className = 'gauge good';
+  }
+}
+
 async function loop(){
   if (!state.running) return;
   state.frames++; tick++;
 
-  let raw = null;
+  let res = null;
   const c1 = grabRoi(1);
-  if (c1) raw = await decodeCanvas(c1);
+  if (c1) res = await decodeCanvas(c1);
 
   // кожен третій кадр — ще спроба з апскейлом (допомагає, коли смуги надто дрібні)
-  if (!raw && tick % 3 === 0){
+  if (!res && tick % 3 === 0){
     const c2 = grabRoi(2);
-    if (c2) raw = await decodeCanvas(c2);
+    if (c2) res = await decodeCanvas(c2);
   }
 
-  if (raw) add(raw, 'скан');
+  let hit = false;
+  if (res){
+    gauge(res);
+    hit = add(res.text, 'скан') === 'new';
+  }
   if (state.frames % 10 === 0) renderDiag();
 
-  rafTimer = setTimeout(loop, raw ? 550 : 90);   // пауза після влучання, щоб не дублювати
+  rafTimer = setTimeout(loop, hit ? 550 : 90);   // пауза після влучання, щоб не дублювати
 }
 
 /* ---------- Ліхтар ---------- */
