@@ -24,6 +24,8 @@
     --ui:'Archivo',system-ui,-apple-system,sans-serif;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  /* мусить бути тут: власний display у правилах нижче інакше перебиває атрибут hidden */
+  [hidden]{display:none !important}
   html,body{margin:0;background:var(--ink);color:var(--paper);font-family:var(--ui)}
   body{padding-bottom:env(safe-area-inset-bottom)}
 
@@ -43,7 +45,12 @@
   /* ---- Камера ---- */
   .stage{position:relative;border:1px solid var(--line);background:#000;overflow:hidden;aspect-ratio:3/4}
   .stage video{width:100%;height:100%;object-fit:cover;display:block}
-  .reticle{position:absolute;left:6%;right:6%;top:50%;transform:translateY(-50%);height:26%;pointer-events:none}
+  .reticle{position:absolute;left:6%;right:6%;top:50%;transform:translateY(-50%);height:19%;pointer-events:none}
+  .live{position:absolute;top:10px;right:10px;display:flex;align-items:center;gap:6px;font-size:10.5px;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--paper);text-shadow:0 1px 3px #000}
+  .live b{width:8px;height:8px;border-radius:50%;background:var(--hazard);animation:pulse 1.1s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  @media (prefers-reduced-motion:reduce){ .live b{animation:none} }
   .reticle i{position:absolute;width:26px;height:26px;border:2px solid var(--kraft)}
   .reticle i:nth-child(1){top:0;left:0;border-right:0;border-bottom:0}
   .reticle i:nth-child(2){top:0;right:0;border-left:0;border-bottom:0}
@@ -126,6 +133,7 @@
   <div class="stage" id="stage">
     <video id="vid" playsinline muted autoplay></video>
     <div class="reticle" hidden id="reticle"><i></i><i></i><i></i><i></i><b></b></div>
+    <div class="live" hidden id="live"><b></b>сканую</div>
     <div class="stage-hint" hidden id="hint">Наведи так, щоб штрихкод S/N заповнив рамку по ширині</div>
     <div class="stage-off" id="off">
       <p>Камера вимкнена.<br>Сторінка має бути відкрита по HTTPS.</p>
@@ -209,7 +217,7 @@ const state = {
 
 const $ = id => document.getElementById(id);
 const els = {
-  vid:$('vid'), stage:$('stage'), off:$('off'), reticle:$('reticle'), hint:$('hint'),
+  vid:$('vid'), stage:$('stage'), off:$('off'), reticle:$('reticle'), hint:$('hint'), live:$('live'),
   start:$('start'), stop:$('stop'), torch:$('torch'), zoomIn:$('zoomIn'), zoomOut:$('zoomOut'),
   last:$('last'), lastTag:$('lastTag'), readout:$('readout'),
   items:$('items'), emptyNote:$('emptyNote'), cnt:$('cnt'), target:$('target'), fill:$('fill'),
@@ -412,6 +420,10 @@ const wctx = work.getContext('2d', {willReadFrequently:true});
 wctx.imageSmoothingEnabled = false;   // різкі краї смуг важливіші за згладжування
 
 async function startCamera(){
+  if (state.running || els.start.disabled) return;   // без цього кожен тап відкривав ще один потік
+  els.start.disabled = true;
+  els.start.textContent = 'Запускаю…';
+  if (stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
   try{
     stream = await navigator.mediaDevices.getUserMedia({
       audio:false,
@@ -424,6 +436,8 @@ async function startCamera(){
   }catch(e){
     els.off.querySelector('p').innerHTML = 'Не вдалося увімкнути камеру:<br>'+e.message
       + '<br><br>Перевір дозвіл на камеру та що адреса починається з https://';
+    els.start.disabled = false;
+    els.start.textContent = 'Спробувати ще раз';
     return;
   }
   els.vid.srcObject = stream;
@@ -447,7 +461,10 @@ async function startCamera(){
   els.off.hidden = true;
   els.reticle.hidden = false;
   els.hint.hidden = false;
+  els.live.hidden = false;
   els.stop.disabled = false;
+  els.start.disabled = false;
+  els.start.textContent = 'Увімкнути камеру';
   state.running = true;
   loop();
 }
@@ -460,6 +477,7 @@ function stopCamera(){
   els.off.hidden = false;
   els.reticle.hidden = true;
   els.hint.hidden = true;
+  els.live.hidden = true;
   els.stop.disabled = els.torch.disabled = els.zoomIn.disabled = els.zoomOut.disabled = true;
   els.off.querySelector('p').textContent = 'Камера вимкнена.';
   els.start.textContent = 'Увімкнути камеру';
@@ -467,7 +485,7 @@ function stopCamera(){
 
 /* Рамка на екрані = 88% ширини, 26% висоти по центру.
    Ті самі частки вирізаємо з нативного кадру. */
-const ROI = { x:0.06, y:0.37, w:0.88, h:0.26 };
+const ROI = { x:0.06, y:0.405, w:0.88, h:0.19 };
 
 function grabRoi(scale){
   const vw = els.vid.videoWidth, vh = els.vid.videoHeight;
