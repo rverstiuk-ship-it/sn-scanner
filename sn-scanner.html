@@ -9,6 +9,10 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<!-- ZBar, скомпільований у WebAssembly. У тестах ZBar і ZXing декодували РІЗНІ
+     етикетки, тому використовуємо обидва — разом вони дають більше влучань.
+     Якщо не завантажиться, сканер працює далі лише на ZXing. -->
+<script src="https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@0.11.0/dist/index.js"></script>
 <style>
   :root{
     --ink:#0E0D0C;
@@ -155,6 +159,11 @@
     <button id="stop" disabled>Стоп</button>
   </div>
 
+  <div class="row">
+    <button id="shotBtn">Зняти фото (якщо не бере)</button>
+  </div>
+  <input type="file" accept="image/*" capture="environment" id="shot" hidden>
+
   <div class="readout" id="readout">
     <div class="lbl">Останнє зчитування</div>
     <div class="val empty" id="last">— очікую штрихкод —</div>
@@ -224,6 +233,9 @@ const state = {
   running: false,
 };
 
+// ZBar-wasm може не підвантажитись з CDN — тоді працюємо без нього
+let zbarReady = (typeof window.zbarWasm !== 'undefined');
+
 const $ = id => document.getElementById(id);
 const els = {
   vid:$('vid'), stage:$('stage'), off:$('off'), reticle:$('reticle'), hint:$('hint'), live:$('live'), gauge:$('gauge'),
@@ -233,6 +245,7 @@ const els = {
   manual:$('manual'), addManual:$('addManual'), clear:$('clear'),
   batch:$('batch'), expect:$('expect'), endpoint:$('endpoint'), secret:$('secret'),
   copy:$('copy'), send:$('send'), sendMsg:$('sendMsg'), diag:$('diag'), log:$('log'),
+  shotBtn:$('shotBtn'), shot:$('shot'),
 };
 
 /* ---------- Збереження між перезавантаженнями ---------- */
@@ -332,9 +345,13 @@ function renderList(){
     + '</li>').join('');
 }
 function renderDiag(){
+  const dec = [];
+  if (nativeDetector) dec.push('native');
+  if (zbarReady) dec.push('zbar-wasm');
+  if (zxingReader) dec.push('zxing');
   els.diag.textContent =
     'кадрів: '+state.frames
-    + ' · декодер: '+(nativeDetector?'native':'zxing')
+    + ' · декодери: '+(dec.join('+') || 'НЕМАЄ')
     + ' · ROI: '+lastRoi
     + ' · сторонніх кодів: '+state.otherCodes;
 }
@@ -394,6 +411,28 @@ async function initDecoders(){
   if (!nativeDetector && !zxingReader) log('Жоден декодер не доступний.');
 }
 
+/* ZBar через WebAssembly. Обгорнутий у try/catch повністю: якщо бібліотека
+   не підвантажилась або API інший — просто повертає null, решта працює. */
+async function zbarDecode(canvas){
+  if (!zbarReady) return null;
+  try{
+    const ctx = canvas.getContext('2d', {willReadFrequently:true});
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const syms = await window.zbarWasm.scanImageData(data);
+    if (!syms || !syms.length) return null;
+    for (const s of syms){
+      let text = '';
+      try{ text = s.decode(); }catch(e){ text = s.data ? String(s.data) : ''; }
+      if (text) return { text: text, width: 0 };
+    }
+    return null;
+  }catch(e){
+    zbarReady = false;             // більше не пробуємо, щоб не гальмувати цикл
+    log('zbar-wasm вимкнено: '+e.message);
+    return null;
+  }
+}
+
 function zxingDecode(canvas){
   if (!zxingReader) return null;
   const w = canvas.width, h = canvas.height;
@@ -426,6 +465,8 @@ async function decodeCanvas(canvas){
       }
     }catch(e){}
   }
+  const z = await zbarDecode(canvas);
+  if (z) return z;
   return zxingDecode(canvas);
 }
 
@@ -635,6 +676,71 @@ els.send.addEventListener('click', async ()=>{
     }
   }finally{ els.send.disabled = false; }
 });
+
+/* ---------- Резерв: повнорозмірний знімок ----------
+   Нативна камера віддає ~4032 px проти 2160 px у прямому потоці, тобто
+   майже вдвічі більше пікселів на модуль, плюс кращий автофокус.
+   Тут ми не обмежені швидкістю, тому перебираємо смуги й масштаби. */
+els.shotBtn.addEventListener('click', ()=> els.shot.click());
+
+els.shot.addEventListener('change', async ()=>{
+  const f = els.shot.files && els.shot.files[0];
+  if (!f) return;
+  els.shotBtn.disabled = true;
+  els.shotBtn.textContent = 'Обробляю знімок…';
+  try{
+    const bmp = await createImageBitmap(f);
+    const found = await decodeStill(bmp);
+    if (found){
+      add(found, 'фото');
+    } else {
+      els.last.textContent = '— на знімку S/N не знайдено —';
+      els.last.classList.add('empty');
+      els.lastTag.innerHTML = '<span class="tag t-dup">спробуй ближче або з ліхтарем</span>';
+      fbWarn();
+    }
+  }catch(e){
+    log('знімок: '+e.message);
+  }finally{
+    els.shot.value = '';
+    els.shotBtn.disabled = false;
+    els.shotBtn.textContent = 'Зняти фото (якщо не бере)';
+  }
+});
+
+async function decodeStill(bmp){
+  const W = bmp.width, H = bmp.height;
+  log('знімок '+W+'×'+H);
+  const c = document.createElement('canvas');
+  const cx = c.getContext('2d', {willReadFrequently:true});
+  cx.imageSmoothingEnabled = false;
+
+  // 1) увесь кадр як є
+  c.width = W; c.height = H;
+  cx.drawImage(bmp, 0, 0);
+  let r = await decodeCanvas(c);
+  if (r && classify(r.text).ok) return r.text;
+
+  // 2) горизонтальні смуги в нативній роздільності, з перекриттям
+  const bandH = Math.round(H*0.16);
+  for (let top = 0; top + bandH <= H; top += Math.round(bandH*0.5)){
+    c.width = W; c.height = bandH;
+    cx.imageSmoothingEnabled = false;
+    cx.drawImage(bmp, 0, top, W, bandH, 0, 0, W, bandH);
+    r = await decodeCanvas(c);
+    if (r && classify(r.text).ok) return r.text;
+  }
+
+  // 3) ті самі смуги, але вдвічі збільшені
+  for (let top = 0; top + bandH <= H; top += Math.round(bandH*0.5)){
+    c.width = W*2; c.height = bandH*2;
+    cx.imageSmoothingEnabled = false;
+    cx.drawImage(bmp, 0, top, W, bandH, 0, 0, W*2, bandH*2);
+    r = await decodeCanvas(c);
+    if (r && classify(r.text).ok) return r.text;
+  }
+  return null;
+}
 
 function log(m){ els.log.textContent = (m+'\n'+els.log.textContent).slice(0,900); }
 
