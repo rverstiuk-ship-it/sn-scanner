@@ -382,6 +382,7 @@ function renderDiag(){
     + ' · декодери: '+(dec.join('+') || 'НЕМАЄ')
     + ' · ROI: '+lastRoi
     + ' · наведень: '+state.hints
+    + (canFilter ? ' · контраст є' : '')
     + ' · сторонніх кодів: '+state.otherCodes;
 }
 function renderAll(){ renderTally(); renderList(); renderDiag(); }
@@ -419,6 +420,47 @@ let nativeDetector = null;
 let zxingReader = null;
 let lastRoi = '—';
 
+/* Налаштування ZBar. Три речі, які за замовчуванням працюють проти нас:
+
+   1) ZBar шукає ВСІ символіки — QR, EAN, UPC, ITF, Codabar, Code39...
+      На етикетці DJI є EAN і UPC, вони рідкі й беруться миттєво. ZBar
+      витрачав на них час і повертав саме їх, а до щільного S/N черга
+      часто не доходила. Лишаємо тільки Code-128.
+
+   2) ZBar тримає кеш: символ мусить підтвердитись у кількох кадрах
+      поспіль, перш ніж його віддадуть. Для межових штрихкодів це вирок —
+      вони й одного разу ледве читаються. Кеш вимикаємо.
+
+   3) ZBAR_CFG_POSITION за замовчуванням може бути вимкнений — тоді немає
+      координат, а без них не працює наведення по Date Code.
+
+   Плюс UNCERTAINTY=0 (віддавати з першої вдалої спроби) і щільність
+   сканування 1 (перевіряти кожен рядок, а не кожен другий). */
+const ZB = {
+  NONE:0, CODE128:128,
+  ENABLE:0, UNCERTAINTY:0x40, POSITION:0x80, X_DENSITY:0x100, Y_DENSITY:0x101
+};
+let zbarScanner = null;
+
+async function initZbar(){
+  if (!window.zbarWasm) return false;
+  try{
+    zbarScanner = await window.zbarWasm.getDefaultScanner();
+    zbarScanner.setConfig(ZB.NONE,    ZB.ENABLE,      0);   // вимкнути все
+    zbarScanner.setConfig(ZB.CODE128, ZB.ENABLE,      1);   // лишити Code-128
+    zbarScanner.setConfig(ZB.CODE128, ZB.POSITION,    1);   // потрібні координати
+    zbarScanner.setConfig(ZB.CODE128, ZB.UNCERTAINTY, 0);   // віддавати одразу
+    zbarScanner.setConfig(ZB.NONE,    ZB.X_DENSITY,   1);
+    zbarScanner.setConfig(ZB.NONE,    ZB.Y_DENSITY,   1);
+    try{ zbarScanner.enableCache(false); }catch(e){}        // без міжкадрового кешу
+    log('zbar: тільки Code-128, кеш вимкнено');
+    return true;
+  }catch(e){
+    log('zbar налаштувати не вдалося: '+e.message);
+    return false;
+  }
+}
+
 async function initDecoders(){
   if ('BarcodeDetector' in window){
     try{
@@ -437,7 +479,8 @@ async function initDecoders(){
       zxingReader.setHints(hints);
     }catch(e){ log('ZXing init: '+e.message); }
   }
-  if (!nativeDetector && !zxingReader) log('Жоден декодер не доступний.');
+  zbarReady = await initZbar();
+  if (!nativeDetector && !zxingReader && !zbarReady) log('Жоден декодер не доступний.');
 }
 
 /* ZBar через WebAssembly. Повертає ВСІ знайдені коди разом з їхньою
@@ -449,7 +492,7 @@ async function zbarScan(canvas){
   try{
     const ctx = canvas.getContext('2d', {willReadFrequently:true});
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const syms = await window.zbarWasm.scanImageData(data);
+    const syms = await window.zbarWasm.scanImageData(data, zbarScanner);
     const out = [];
     for (const s of (syms || [])){
       let text = '';
@@ -499,33 +542,53 @@ function zxingDecode(canvas){
   finally{ try{ zxingReader.reset(); }catch(e){} }
 }
 
-/* Повертає список знайдених кодів. Порядок рушіїв: нативний (Android),
-   ZBar на WASM (швидкий), ZXing на JS (повільний, тому не щокадру). */
+/* Збирає результати ВСІХ доступних рушіїв.
+
+   Раніше тут була помилка: перший-ліпший знайдений код зупиняв пошук.
+   ZBar знаходив легкий Date Code — і ZXing уже не викликався, хоча міг
+   узяти щільний S/N. Тепер зупиняємось лише тоді, коли знайдено саме
+   серійник; інакше пробуємо наступний рушій на тому ж кадрі. */
+function hasSerial(list){
+  for (const f of (list||[])) if (classify(f.text).ok) return true;
+  return false;
+}
+
 async function decodeCanvas(canvas, allowZxing){
+  let all = [];
+
   if (nativeDetector){
     try{
       const found = await nativeDetector.detect(canvas);
-      const out = [];
       for (const b of found){
         if (!b.rawValue) continue;
         const bb = b.boundingBox;
-        out.push({ text:b.rawValue,
+        all.push({ text:b.rawValue,
                    box: bb ? {x0:bb.x, x1:bb.x+bb.width, y0:bb.y, y1:bb.y+bb.height} : null });
       }
-      if (out.length) return out;
+      if (hasSerial(all)) return all;
     }catch(e){}
   }
+
   const z = await zbarScan(canvas);
-  if (z.length) return z;
-  if (allowZxing === false) return [];
-  const x = zxingDecode(canvas);
-  return x ? [x] : [];
+  all = all.concat(z);
+  if (hasSerial(all)) return all;
+
+  if (allowZxing !== false){
+    const x = zxingDecode(canvas);
+    if (x) all.push(x);
+  }
+  return all;
 }
 
 /* ---------- Камера ---------- */
 let stream=null, track=null, rafTimer=null, tick=0;
 let lastGrab = { sy:0, scale:1 };     // де саме взяли останній кадр — для наведення
 const work = document.createElement('canvas');
+const canFilter = (() => {                    // Safari додав ctx.filter лише у 17
+  try{ const c=document.createElement('canvas').getContext('2d');
+       c.filter='contrast(1.5)'; return c.filter !== 'none' && c.filter !== undefined; }
+  catch(e){ return false; }
+})();
 const wctx = work.getContext('2d', {willReadFrequently:true});
 wctx.imageSmoothingEnabled = false;   // різкі краї смуг важливіші за згладжування
 
@@ -643,7 +706,7 @@ function setHintFromDateCode(box){
   hintLeft = HINT_TTL;
 }
 
-function grabHint(scale){
+function grabHint(scale, boost){
   const vw = els.vid.videoWidth, vh = els.vid.videoHeight;
   if (!vw || !vh || !hint) return null;
   let sy = Math.round(hint.yc - hint.h/2);
@@ -654,8 +717,12 @@ function grabHint(scale){
   work.width  = Math.round(vw*scale);
   work.height = Math.round(sh*scale);
   wctx.imageSmoothingEnabled = false;
+  // Підсилення контрасту робить межі смуг різкішими. Виконується на GPU,
+  // тому майже безкоштовне — але є не в усіх версіях Safari, звідси перевірка.
+  wctx.filter = (boost && canFilter) ? 'contrast(1.6) brightness(1.05)' : 'none';
   wctx.drawImage(els.vid, 0, sy, vw, sh, 0, 0, work.width, work.height);
-  lastRoi = vw+'×'+sh + ' наведення ×'+scale;
+  wctx.filter = 'none';
+  lastRoi = vw+'×'+sh + ' наведення ×'+scale + (boost && canFilter ? ' контраст' : '');
   lastGrab = { sy: sy, scale: scale };
   return work;
 }
@@ -685,38 +752,56 @@ async function loop(){
 
   let found = [];
 
-  // 1. Якщо наведення активне — б'ємо точно в очікувану смугу S/N,
-  //    вдвічі збільшену. Смуга вузька, тому це не дорожче за звичайний кадр.
+  // 1. Наведення активне — б'ємо точно в очікувану смугу S/N, збільшену вдвічі
   if (hintLeft > 0){
     hintLeft--;
-    const ch = grabHint(2);
+    const ch = grabHint(2, false);
     if (ch) found = await decodeCanvas(ch, true);
+    // не взялось — той самий кадр, але з підсиленим контрастом
+    if (!hasSerial(found) && canFilter){
+      const cb = grabHint(2, true);
+      if (cb) found = found.concat(await decodeCanvas(cb, true));
+    }
   }
 
-  // 2. Інакше (або якщо наведення не спрацювало) — звичайний перебір смуг.
-  if (!found.length){
+  // 2. Інакше — перебір смуг по кадру
+  if (!hasSerial(found)){
     const band = tick % ROI_BANDS.length;
-    const heavy = (tick % 3 === 0);        // ZXing повільний, не щокадру
+    const heavy = (tick % 4 === 0);        // ZXing найповільніший, не щокадру
     const c1 = grabRoi(1, band);
-    if (c1) found = await decodeCanvas(c1, heavy);
+    if (c1){
+      const r = await decodeCanvas(c1, heavy);
+      found = found.concat(r);
 
-    if (!found.length && tick % 6 === 0){
-      const c2 = grabRoi(2, band);
-      if (c2) found = await decodeCanvas(c2, true);
+      // 3. Трапився Date Code — наводимось і пробуємо S/N ОДРАЗУ,
+      //    не чекаючи наступного кадру. Смуга вузька, це дешево.
+      if (!hasSerial(found)){
+        for (const f of r){
+          if (/^CP[0-9A-Z]{14}$/.test(f.text || '') && f.box){
+            setHintFromDateCode(f.box);
+            const ch2 = grabHint(3, false);
+            if (ch2) found = found.concat(await decodeCanvas(ch2, true));
+            break;
+          }
+        }
+      }
     }
   }
 
   let hit = false;
   let sawSerial = false;
+  const seenThisFrame = new Set();
   for (const f of found){
     const t = f.text || '';
-    if (t.indexOf('1581') === 0){
+    if (seenThisFrame.has(t)) continue;
+    seenThisFrame.add(t);
+    if (classify(t).ok){
       sawSerial = true;
       gauge(f.box, t);
       if (add(t, 'скан') === 'new') hit = true;
     } else if (/^CP[0-9A-Z]{14}$/.test(t)){
       gauge(f.box, t);
-      setHintFromDateCode(f.box);        // ось воно — навелись на S/N
+      setHintFromDateCode(f.box);
       state.otherCodes++;
     } else {
       state.otherCodes++;
@@ -726,7 +811,7 @@ async function loop(){
 
   if (state.frames % 10 === 0) renderDiag();
 
-  rafTimer = setTimeout(loop, hit ? 550 : 70);   // пауза після влучання, щоб не дублювати
+  rafTimer = setTimeout(loop, hit ? 500 : 50);
 }
 
 /* ---------- Ліхтар ---------- */
