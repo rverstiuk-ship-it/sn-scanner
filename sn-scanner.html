@@ -196,6 +196,10 @@
     <input id="endpoint" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
     <label for="secret">Спільний ключ</label>
     <input id="secret" placeholder="той самий, що в скрипті" autocomplete="off">
+    <p class="hint" id="epInfo"></p>
+    <div class="row" style="margin-top:10px">
+      <button id="ping">Перевірити зв'язок</button>
+    </div>
     <p class="hint">Адреса й ключ зберігаються лише на цьому телефоні. Токен Telegram-бота тут не потрібен — його тримає Apps Script.</p>
     <div class="row" style="margin-top:12px">
       <button id="copy">Копіювати список</button>
@@ -245,7 +249,7 @@ const els = {
   manual:$('manual'), addManual:$('addManual'), clear:$('clear'),
   batch:$('batch'), expect:$('expect'), endpoint:$('endpoint'), secret:$('secret'),
   copy:$('copy'), send:$('send'), sendMsg:$('sendMsg'), diag:$('diag'), log:$('log'),
-  shotBtn:$('shotBtn'), shot:$('shot'),
+  shotBtn:$('shotBtn'), shot:$('shot'), ping:$('ping'), epInfo:$('epInfo'),
 };
 
 /* ---------- Збереження між перезавантаженнями ---------- */
@@ -641,6 +645,39 @@ els.copy.addEventListener('click', async ()=>{
    CORS до неї не застосовується взагалі — Safari не може її заблокувати.
    Відповідь прочитати не можемо (інший домен), тому підтвердженням служить
    повідомлення в Telegram, яке надсилає сам Apps Script. */
+/* Адреса Web App має точний вигляд. Найчастіша прикрість — обрізана під час
+   вставки адреса: запит іде в нікуди, помилки немає, у журналі порожньо.
+   Тому перевіряємо форму адреси і показуємо її хвіст, щоб обрізання було видно. */
+const RE_EXEC = /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/;
+
+function showEndpointInfo(){
+  const u = els.endpoint.value.trim();
+  if (!u){ els.epInfo.textContent = 'Адресу не вписано.'; return; }
+  const tail = u.length > 18 ? '…' + u.slice(-18) : u;
+  els.epInfo.textContent = RE_EXEC.test(u)
+    ? 'Адреса виглядає правильно · ' + u.length + ' символів · закінчується на ' + tail
+    : '⚠️ Адреса неправильна — має закінчуватись на /exec · зараз ' + u.length + ' символів · ' + tail;
+}
+els.endpoint.addEventListener('input', showEndpointInfo);
+
+/* Відкриває адресу в прихованій рамці звичайним GET. Прочитати відповідь
+   Safari не дасть, але запит долетить і залишить рядок в аркуші «_Лог» —
+   так видно, чи саме ЦЯ збережена адреса робоча. */
+els.ping.addEventListener('click', ()=>{
+  const u = els.endpoint.value.trim();
+  if (!RE_EXEC.test(u)){
+    els.sendMsg.textContent = 'Спершу виправ адресу — вона має закінчуватись на /exec';
+    fbWarn(); return;
+  }
+  const ifr = document.createElement('iframe');
+  ifr.style.cssText = 'position:absolute;left:-9999px;width:0;height:0;border:0';
+  ifr.src = u + '?ping=1';
+  document.body.appendChild(ifr);
+  setTimeout(()=>{ try{ ifr.remove(); }catch(e){} }, 8000);
+  els.sendMsg.textContent = 'Запит пішов. Подивись у таблиці аркуш «_Лог» — '
+    + 'там має з\'явитись рядок з поміткою GET.';
+});
+
 function sendViaHiddenForm(url, payloadStr){
   return new Promise(resolve=>{
     const name = 'snsink_' + Date.now();
@@ -680,6 +717,12 @@ els.send.addEventListener('click', async ()=>{
   const secret = els.secret.value.trim();
   if (!state.serials.size){ els.sendMsg.textContent='Спершу відскануй хоч один серійник.'; return; }
   if (!url){ els.sendMsg.textContent='Впиши адресу Apps Script (/exec).'; return; }
+  if (!RE_EXEC.test(url)){
+    els.sendMsg.textContent = '⚠️ Адреса неправильна ('+url.length+' симв.). Має бути вигляду '
+      + 'https://script.google.com/macros/s/…/exec — схоже, вона обрізалась при вставці.';
+    fbWarn();
+    return;
+  }
 
   const rows = [...state.serials.entries()].sort((a,b)=>a[1].seq-b[1].seq)
     .map(([s,m])=>({ serial:s, seq:m.seq, src:m.src, flag:m.flag||'', ts:new Date(m.ts).toISOString() }));
@@ -786,7 +829,7 @@ async function decodeStill(bmp){
 
 function log(m){ els.log.textContent = (m+'\n'+els.log.textContent).slice(0,900); }
 
-initDecoders().then(()=>{ restore(); renderDiag(); });
+initDecoders().then(()=>{ restore(); showEndpointInfo(); renderDiag(); });
 </script>
 </body>
 </html>
