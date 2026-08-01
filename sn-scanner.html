@@ -264,6 +264,11 @@ const state = {
 // ZBar-wasm може не підвантажитись з CDN — тоді працюємо без нього
 let zbarReady = (typeof window.zbarWasm !== 'undefined');
 
+// Фоновий потік декодування; якщо не підніметься, все працює в основному
+let worker = null, workerReady = false, workerZbar = false, workerZxing = false;
+let reqId = 0;
+const pending = new Map();
+
 const $ = id => document.getElementById(id);
 const els = {
   vid:$('vid'), stage:$('stage'), off:$('off'), reticle:$('reticle'), hint:$('hint'), live:$('live'), gauge:$('gauge'),
@@ -374,12 +379,18 @@ function renderList(){
 }
 function renderDiag(){
   const dec = [];
-  if (nativeDetector) dec.push('native');
-  if (zbarReady) dec.push('zbar-wasm');
-  if (zxingReader) dec.push('zxing');
+  if (workerReady){
+    if (workerZbar) dec.push('zbar');
+    if (workerZxing) dec.push('zxing');
+  } else {
+    if (nativeDetector) dec.push('native');
+    if (zbarReady) dec.push('zbar-wasm');
+    if (zxingReader) dec.push('zxing');
+  }
   els.diag.textContent =
     'кадрів: '+state.frames
     + ' · декодери: '+(dec.join('+') || 'НЕМАЄ')
+    + (workerReady ? ' у фоні' : ' в основному потоці')
     + ' · ROI: '+lastRoi
     + ' · наведень: '+state.hints
     + (canFilter ? ' · контраст є' : '')
@@ -480,7 +491,12 @@ async function initDecoders(){
     }catch(e){ log('ZXing init: '+e.message); }
   }
   zbarReady = await initZbar();
-  if (!nativeDetector && !zxingReader && !zbarReady) log('Жоден декодер не доступний.');
+  // Фоновий потік — основний режим. Головний лишається як запасний,
+  // тому декодери на ньому теж ініціалізуємо.
+  workerReady = await initWorker();
+  if (!nativeDetector && !zxingReader && !zbarReady && !workerReady){
+    log('Жоден декодер не доступний.');
+  }
 }
 
 /* ZBar через WebAssembly. Повертає ВСІ знайдені коди разом з їхньою
@@ -580,6 +596,196 @@ async function decodeCanvas(canvas, allowZxing){
   return all;
 }
 
+/* ============================================================
+   ФОНОВИЙ ПОТІК ДЕКОДУВАННЯ
+
+   Досі кадр знімався й декодувався в тому самому потоці, що малює відео
+   й обробляє дотики. Поки йшло декодування, сторінка стояла — звідси
+   і сіпання перегляду, і мала кількість спроб за секунду.
+
+   Тепер головний потік лише вирізає кадр через createImageBitmap (це
+   майже безкоштовно й асинхронно) і передає його у фон БЕЗ копіювання.
+   Уся важка робота — масштабування, читання пікселів, декодування —
+   відбувається там.
+
+   Якщо фоновий потік з будь-якої причини не підніметься (наприклад,
+   бібліотека не знайде свій .wasm), сканер мовчки працює як раніше.
+   ============================================================ */
+const ZBAR_JS   = 'https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@0.11.0/dist/index.js';
+const ZBAR_WASM = 'https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@0.11.0/dist/zbar.wasm';
+const ZXING_JS  = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
+
+const WORKER_SRC = `
+let zbarOk = false, zbarScanner = null, zxingReader = null;
+
+try { importScripts('${ZBAR_JS}'); } catch (e) {}
+try { importScripts('${ZXING_JS}'); } catch (e) {}
+
+(async function init(){
+  try{
+    if (self.zbarWasm){
+      // У воркері з blob-адреси бібліотека не може вирахувати, де лежить
+      // її .wasm — вказуємо явно, інакше ZBar тут просто не завантажиться.
+      if (self.zbarWasm.setModuleArgs){
+        self.zbarWasm.setModuleArgs({ locateFile: () => '${ZBAR_WASM}' });
+      }
+      zbarScanner = await self.zbarWasm.getDefaultScanner();
+      zbarScanner.setConfig(0,   0,     0);      // вимкнути всі символіки
+      zbarScanner.setConfig(128, 0,     1);      // лишити Code-128
+      zbarScanner.setConfig(128, 0x80,  1);      // координати
+      zbarScanner.setConfig(128, 0x40,  0);      // віддавати одразу
+      zbarScanner.setConfig(0,   0x100, 1);
+      zbarScanner.setConfig(0,   0x101, 1);
+      try{ zbarScanner.enableCache(false); }catch(e){}
+      zbarOk = true;
+    }
+  }catch(e){}
+  try{
+    if (self.ZXing){
+      const hints = new Map();
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.CODE_128]);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+      zxingReader = new ZXing.MultiFormatReader();
+      zxingReader.setHints(hints);
+    }
+  }catch(e){}
+  postMessage({ type:'ready', zbar: zbarOk, zxing: !!zxingReader });
+})();
+
+function zxingOn(imgData){
+  if (!zxingReader) return null;
+  const w = imgData.width, h = imgData.height, rgba = imgData.data;
+  const lum = new Uint8ClampedArray(w*h);
+  for (let i=0, j=0; i<rgba.length; i+=4, j++){
+    lum[j] = (rgba[i]*306 + rgba[i+1]*601 + rgba[i+2]*117) >> 10;
+  }
+  try{
+    const src = new ZXing.RGBLuminanceSource(lum, w, h);
+    const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
+    const res = zxingReader.decode(bmp);
+    if (!res) return null;
+    let box = null;
+    try{
+      const pts = res.getResultPoints();
+      const xs = pts.map(p=>p.getX()), ys = pts.map(p=>p.getY());
+      box = { x0:Math.min.apply(null,xs), x1:Math.max.apply(null,xs),
+              y0:Math.min.apply(null,ys), y1:Math.max.apply(null,ys) };
+    }catch(e){}
+    return { text: res.getText(), box: box };
+  }catch(e){ return null; }
+  finally{ try{ zxingReader.reset(); }catch(e){} }
+}
+
+async function zbarOn(imgData){
+  if (!zbarOk) return [];
+  try{
+    const syms = await self.zbarWasm.scanImageData(imgData, zbarScanner);
+    const out = [];
+    for (const s of (syms || [])){
+      let text = '';
+      try{ text = s.decode(); }catch(e){}
+      if (!text) continue;
+      let box = null;
+      try{
+        const pts = s.points || [];
+        if (pts.length){
+          const xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
+          box = { x0:Math.min.apply(null,xs), x1:Math.max.apply(null,xs),
+                  y0:Math.min.apply(null,ys), y1:Math.max.apply(null,ys) };
+        }
+      }catch(e){}
+      out.push({ text: text, box: box });
+    }
+    return out;
+  }catch(e){ zbarOk = false; return []; }
+}
+
+const RE_SN = /^1581[0-9A-Z]{16}$/;
+const hasSN = list => list.some(f => RE_SN.test(String(f.text||'').toUpperCase().replace(/O/g,'0')));
+
+self.onmessage = async (ev) => {
+  const m = ev.data;
+  if (!m || m.type !== 'frame') return;
+  let results = [];
+  try{
+    const w = Math.round(m.bitmap.width * m.scale);
+    const h = Math.round(m.bitmap.height * m.scale);
+    const oc = new OffscreenCanvas(w, h);
+    const cx = oc.getContext('2d', { willReadFrequently: true });
+    cx.imageSmoothingEnabled = false;
+    if (m.boost){ try{ cx.filter = 'contrast(1.6) brightness(1.05)'; }catch(e){} }
+    cx.drawImage(m.bitmap, 0, 0, w, h);
+    m.bitmap.close();
+    const imgData = cx.getImageData(0, 0, w, h);
+
+    results = await zbarOn(imgData);
+    if (!hasSN(results) && m.allowZxing){
+      const x = zxingOn(imgData);
+      if (x) results.push(x);
+    }
+  }catch(e){
+    try{ m.bitmap.close(); }catch(e2){}
+  }
+  postMessage({ type:'result', id: m.id, results: results });
+};
+`;
+
+async function initWorker(){
+  // потрібні і фонові полотна, і вирізання кадру без блокування
+  if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap !== 'function') return false;
+  try{
+    const url = URL.createObjectURL(new Blob([WORKER_SRC], { type:'text/javascript' }));
+    worker = new Worker(url);
+    const ok = await new Promise(resolve => {
+      const t = setTimeout(()=>resolve(false), 8000);
+      worker.onmessage = (ev)=>{
+        const m = ev.data;
+        if (m.type === 'ready'){
+          clearTimeout(t);
+          workerZbar = !!m.zbar; workerZxing = !!m.zxing;
+          resolve(m.zbar || m.zxing);
+        } else if (m.type === 'result'){
+          const r = pending.get(m.id);
+          if (r){ pending.delete(m.id); r(m.results || []); }
+        }
+      };
+      worker.onerror = ()=>{ clearTimeout(t); resolve(false); };
+    });
+    if (!ok){ try{ worker.terminate(); }catch(e){} worker = null; return false; }
+    log('фоновий потік: ' + (workerZbar?'zbar ':'') + (workerZxing?'zxing':''));
+    return true;
+  }catch(e){
+    log('фоновий потік не піднявся: '+e.message);
+    worker = null;
+    return false;
+  }
+}
+
+/* Вирізає ділянку кадру й віддає у фон. На головному потоці лишається
+   тільки createImageBitmap — решта відбувається паралельно. */
+async function decodeInWorker(sy, sh, scale, boost, allowZxing){
+  const vw = els.vid.videoWidth, vh = els.vid.videoHeight;
+  if (!vw || !vh || sh < 20) return [];
+  if (sy < 0){ sh += sy; sy = 0; }
+  if (sy + sh > vh) sh = vh - sy;
+  if (sh < 20) return [];
+  let bmp;
+  try{ bmp = await createImageBitmap(els.vid, 0, sy, vw, sh); }
+  catch(e){ return []; }
+  lastGrab = { sy: sy, scale: scale };
+  lastRoi  = vw+'×'+sh + ' ×'+scale + (boost?' контраст':'') + ' [фон]';
+  const id = ++reqId;
+  return new Promise(resolve => {
+    const t = setTimeout(()=>{ pending.delete(id); resolve([]); }, 4000);
+    pending.set(id, (res)=>{ clearTimeout(t); resolve(res); });
+    try{
+      worker.postMessage({ type:'frame', id, bitmap: bmp, scale, boost, allowZxing }, [bmp]);
+    }catch(e){
+      clearTimeout(t); pending.delete(id); resolve([]);
+    }
+  });
+}
+
 /* ---------- Камера ---------- */
 let stream=null, track=null, rafTimer=null, tick=0;
 let lastGrab = { sy:0, scale:1 };     // де саме взяли останній кадр — для наведення
@@ -651,6 +857,7 @@ function stopCamera(){
   els.live.hidden = true;
   els.gauge.className = 'gauge';
   hint = null; hintLeft = 0;
+  pending.clear();
   els.stop.disabled = els.torch.disabled = true;
   els.off.querySelector('p').textContent = 'Камера вимкнена.';
   els.start.textContent = 'Увімкнути камеру';
@@ -662,6 +869,16 @@ function stopCamera(){
    S/N — найдовший штрихкод, будь-яке обрізання по краях його вбиває. */
 const ROI_BANDS = [0.35, 0.50, 0.65];   // центри смуг у частках висоти кадру
 const ROI_H = 0.19;
+
+function roiGeom(bandIdx){
+  const vh = els.vid.videoHeight;
+  const cy = ROI_BANDS[bandIdx % ROI_BANDS.length];
+  return { sy: Math.round(vh*(cy - ROI_H/2)), sh: Math.round(vh*ROI_H) };
+}
+function hintGeom(){
+  if (!hint) return null;
+  return { sy: Math.round(hint.yc - hint.h/2), sh: Math.round(hint.h) };
+}
 
 function grabRoi(scale, bandIdx){
   const vw = els.vid.videoWidth, vh = els.vid.videoHeight;
@@ -746,50 +963,59 @@ function gauge(box, text){
   }
 }
 
+/* Один прохід декодування. Якщо фоновий потік живий — уся важка робота
+   там, головний лише вирізає кадр. Інакше працює як раніше. */
+async function tryDecode(geom, scale, boost, allowZxing){
+  if (!geom) return [];
+  if (workerReady){
+    return await decodeInWorker(geom.sy, geom.sh, scale, boost, allowZxing);
+  }
+  const c = (geom.hintMode ? grabHint(scale, boost) : grabRoi(scale, geom.bandIdx));
+  return c ? await decodeCanvas(c, allowZxing) : [];
+}
+
 async function loop(){
   if (!state.running) return;
   state.frames++; tick++;
 
   let found = [];
 
-  // 1. Наведення активне — б'ємо точно в очікувану смугу S/N, збільшену вдвічі
+  // 1. Наведення активне — б'ємо точно в очікувану смугу S/N
   if (hintLeft > 0){
     hintLeft--;
-    const ch = grabHint(2, false);
-    if (ch) found = await decodeCanvas(ch, true);
-    // не взялось — той самий кадр, але з підсиленим контрастом
-    if (!hasSerial(found) && canFilter){
-      const cb = grabHint(2, true);
-      if (cb) found = found.concat(await decodeCanvas(cb, true));
+    const g = hintGeom();
+    if (g){
+      g.hintMode = true;
+      found = await tryDecode(g, 2, false, true);
+      if (!hasSerial(found) && (canFilter || workerReady)){
+        found = found.concat(await tryDecode(g, 2, true, true));
+      }
     }
   }
 
   // 2. Інакше — перебір смуг по кадру
   if (!hasSerial(found)){
-    const band = tick % ROI_BANDS.length;
-    const heavy = (tick % 4 === 0);        // ZXing найповільніший, не щокадру
-    const c1 = grabRoi(1, band);
-    if (c1){
-      const r = await decodeCanvas(c1, heavy);
-      found = found.concat(r);
+    const bandIdx = tick % ROI_BANDS.length;
+    const heavy = (tick % 4 === 0);
+    const g = roiGeom(bandIdx); g.bandIdx = bandIdx;
+    const r = await tryDecode(g, 1, false, heavy);
+    found = found.concat(r);
 
-      // 3. Трапився Date Code — наводимось і пробуємо S/N ОДРАЗУ,
-      //    не чекаючи наступного кадру. Смуга вузька, це дешево.
-      if (!hasSerial(found)){
-        for (const f of r){
-          if (/^CP[0-9A-Z]{14}$/.test(f.text || '') && f.box){
-            setHintFromDateCode(f.box);
-            const ch2 = grabHint(3, false);
-            if (ch2) found = found.concat(await decodeCanvas(ch2, true));
-            break;
-          }
+    // 3. Трапився Date Code — наводимось і пробуємо S/N ОДРАЗУ
+    if (!hasSerial(found)){
+      for (const f of r){
+        if (/^CP[0-9A-Z]{14}$/.test(f.text || '') && f.box){
+          setHintFromDateCode(f.box);
+          const g2 = hintGeom();
+          if (g2){ g2.hintMode = true;
+            found = found.concat(await tryDecode(g2, 3, false, true)); }
+          break;
         }
       }
     }
   }
 
-  let hit = false;
-  let sawSerial = false;
+  let hit = false, sawSerial = false;
   const seenThisFrame = new Set();
   for (const f of found){
     const t = f.text || '';
@@ -807,11 +1033,12 @@ async function loop(){
       state.otherCodes++;
     }
   }
-  if (sawSerial) hintLeft = Math.max(hintLeft, 4);   // тримаємось етикетки
+  if (sawSerial) hintLeft = Math.max(hintLeft, 4);
 
   if (state.frames % 10 === 0) renderDiag();
 
-  rafTimer = setTimeout(loop, hit ? 500 : 50);
+  // у фоновому режимі головний потік вільний, тому можна частіше
+  rafTimer = setTimeout(loop, hit ? 500 : (workerReady ? 25 : 50));
 }
 
 /* ---------- Ліхтар ---------- */
