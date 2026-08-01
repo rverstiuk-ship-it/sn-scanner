@@ -870,31 +870,6 @@ els.ping.addEventListener('click', ()=>{
   els.sendMsg.textContent = 'Відкрив перевірку в новій вкладці. Якщо там сторінка «ПРИЙНЯТО» — канал робочий.';
 });
 
-/* Safari блокує міжсайтові запити З КОДУ сторінки (fetch, форма в рамку) —
-   перевірено: ті самі адреси з адресного рядка проходять, а зі сторінки ні.
-   Не блокується лише НАВІГАЦІЯ. Тому надсилаємо справжньою формою, але
-   в НОВУ ВКЛАДКУ (target=_blank): так сканер лишається живим на своєму
-   домені — камера працює, список серійників на місці. Перехід у тій самій
-   вкладці цього не давав: сторінка опинялась у пісочниці Apps Script,
-   де камера заборонена, а сховище браузера вже інше. */
-function sendViaNavigation(url, payloadStr){
-  const form = document.createElement('form');
-  form.method = 'POST';
-  form.action = url;
-  form.target = '_blank';
-  form.enctype = 'application/x-www-form-urlencoded';
-  form.style.display = 'none';
-  const put = (n, v) => {
-    const i = document.createElement('input');
-    i.type = 'hidden'; i.name = n; i.value = v;
-    form.appendChild(i);
-  };
-  put('payload', payloadStr);
-  put('nav', '1');
-  document.body.appendChild(form);
-  form.submit();
-  setTimeout(()=>{ try{ form.remove(); }catch(e){} }, 2000);
-}
 
 function sendViaHiddenForm(url, payloadStr){
   return new Promise(resolve=>{
@@ -930,9 +905,18 @@ function sendViaHiddenForm(url, payloadStr){
     form.submit();
   });
 }
-els.send.addEventListener('click', async ()=>{
-  const url = ENDPOINT;
-  const secret = SECRET;
+/* Надсилання. КРИТИЧНО: усе робиться СИНХРОННО, прямо в обробнику дотику.
+
+   Раніше тут спершу викликався fetch, і лише коли він падав — відкривалась
+   вкладка з результатом. Але браузер дозволяє відкрити вкладку тільки
+   безпосередньо у відповідь на дотик користувача. Поки fetch відпрацьовував,
+   цей дозвіл згорав, і вкладка блокувалась як спливне вікно — мовчки, без
+   жодної помилки. На одному телефоні встигало, на іншому ні.
+
+   Тому fetch прибрано зовсім: він однаково не працює через міжсайтові
+   обмеження Safari (перевірено журналом на боці скрипта). Лишилась сама
+   форма — єдиний канал, який проходить скрізь. */
+els.send.addEventListener('click', ()=>{
   if (!state.serials.size){ els.sendMsg.textContent='Спершу відскануй хоч один серійник.'; return; }
   if (!els.who.value.trim()){
     els.sendMsg.textContent = 'Впиши, хто сканує — без цього не видно, чий це прийом.';
@@ -943,9 +927,9 @@ els.send.addEventListener('click', async ()=>{
     setTimeout(()=>{ els.who.style.borderColor=''; }, 2500);
     return;
   }
-  if (!RE_EXEC.test(url)){
+  if (!RE_EXEC.test(ENDPOINT)){
     els.sendMsg.textContent = '⚠️ Прошита адреса приймача неправильна. '
-      + 'Виправ константу ENDPOINT у файлі сканера й перезалий його.';
+      + 'Виправ константу ENDPOINT у файлі сканера й перезалей його.';
     fbWarn();
     return;
   }
@@ -953,39 +937,47 @@ els.send.addEventListener('click', async ()=>{
   const rows = [...state.serials.entries()].sort((a,b)=>a[1].seq-b[1].seq)
     .map(([s,m])=>({ serial:s, seq:m.seq, src:m.src, flag:m.flag||'', ts:new Date(m.ts).toISOString() }));
 
-  els.send.disabled = true;
-  els.sendMsg.textContent = 'Надсилаю '+rows.length+'…';
-
   const payloadStr = JSON.stringify({
-    secret, who: els.who.value.trim(), batch: els.batch.value.trim(),
+    secret: SECRET, who: els.who.value.trim(), batch: els.batch.value.trim(),
     expected: parseInt(els.expect.value,10) || null,
     count: rows.length, serials: rows
   });
 
-  // Спершу пробуємо fetch — тоді зможемо показати точну відповідь скрипта.
-  // Тип application/x-www-form-urlencoded обрано свідомо: він "простий"
-  // (без preflight) І Apps Script гарантовано розбирає його в e.parameter.
-  // multipart/form-data від FormData Apps Script у e.parameter НЕ кладе.
-  const body = new URLSearchParams();
-  body.set('payload', payloadStr);
+  persist();
 
-  try{
-    const res = await fetch(url, { method:'POST', body: body });
-    const txt = await res.text();
-    let out; try{ out = JSON.parse(txt); }catch(e){ out = null; }
-    if (out && out.ok){
-      els.sendMsg.textContent = 'Готово: додано '+out.added+', дублікатів '+out.skipped
-        + (out.telegram ? ', у Telegram надіслано.' : ', але Telegram не відповів.');
-    } else {
-      els.sendMsg.textContent = 'Скрипт відповів помилкою: '+(out && out.error ? out.error : txt.slice(0,180));
-    }
-  }catch(e){
-    // Safari блокує запит із коду сторінки — надсилаємо формою в нову вкладку.
-    persist();
-    sendViaNavigation(url, payloadStr);
-    els.sendMsg.textContent = 'Надіслано '+rows.length+'. Результат — у новій вкладці. '
+  // Вкладку відкриваємо ПЕРШОЮ дією після дотику — поки дозвіл ще діє
+  let win = null;
+  try{ win = window.open('about:blank', 'snresult'); }catch(e){}
+
+  const form = document.createElement('form');
+  form.method  = 'POST';
+  form.action  = ENDPOINT;
+  form.enctype = 'application/x-www-form-urlencoded';
+  form.style.display = 'none';
+  const put = (n, v) => {
+    const i = document.createElement('input');
+    i.type = 'hidden'; i.name = n; i.value = v;
+    form.appendChild(i);
+  };
+  put('payload', payloadStr);
+  put('nav', '1');
+
+  if (win){
+    // нова вкладка відкрилась — шлемо в неї, сканер лишається живим
+    form.target = 'snresult';
+    put('back', '');
+    els.sendMsg.textContent = 'Надіслано '+rows.length+'. Результат — у сусідній вкладці. '
       + 'Ця сторінка лишається робочою, список не втрачено.';
-  }finally{ els.send.disabled = false; }
+  } else {
+    // вкладку заблоковано — йдемо в цій же, з посиланням на повернення
+    form.target = '_self';
+    put('back', location.href.split('#')[0]);
+    els.sendMsg.textContent = 'Надсилаю '+rows.length+'…';
+  }
+
+  document.body.appendChild(form);
+  form.submit();
+  setTimeout(()=>{ try{ form.remove(); }catch(e){} }, 3000);
 });
 
 /* ---------- Резерв: повнорозмірний знімок ----------
