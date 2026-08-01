@@ -140,6 +140,14 @@
   </div>
 </div>
 
+<div id="wrongOrigin" hidden style="background:#E33B1B;color:#fff;padding:14px;font-size:13px;line-height:1.5">
+  <b>Сторінку відкрито не з того домену.</b><br>
+  Камера тут не працює, а список серійників зберігається окремо для кожного домену —
+  твої записи не втрачені, вони на основній адресі.
+  <a id="goHome" href="#" style="display:block;margin-top:10px;background:#fff;color:#0E0D0C;
+     padding:12px;text-align:center;font-weight:700;text-decoration:none">Відкрити правильну адресу</a>
+</div>
+
 <main>
 
   <div class="stage" id="stage">
@@ -670,20 +678,23 @@ els.ping.addEventListener('click', ()=>{
     fbWarn(); return;
   }
   persist();
-  // саме перехід, а не запит із коду — інакше Safari не пропустить
-  location.href = u + '?ping=1&back=' + encodeURIComponent(location.href.split('#')[0]);
+  // нова вкладка, а не перехід — інакше сканер опиниться в пісочниці скрипта
+  window.open(u + '?ping=1', '_blank');
+  els.sendMsg.textContent = 'Відкрив перевірку в новій вкладці. Якщо там сторінка «ПРИЙНЯТО» — канал робочий.';
 });
 
-/* Safari блокує будь-які міжсайтові запити З КОДУ сторінки (fetch, форма в
-   рамку) — перевірено: ті самі адреси з адресного рядка проходять, а зі
-   сторінки ні. Не блокується лише НАВІГАЦІЯ. Тому надсилаємо справжньою
-   формою без target: браузер переходить на сторінку скрипта, той приймає
-   дані й показує результат із кнопкою повернення.
-   Список не втрачається — він збережений у пам'яті телефона. */
+/* Safari блокує міжсайтові запити З КОДУ сторінки (fetch, форма в рамку) —
+   перевірено: ті самі адреси з адресного рядка проходять, а зі сторінки ні.
+   Не блокується лише НАВІГАЦІЯ. Тому надсилаємо справжньою формою, але
+   в НОВУ ВКЛАДКУ (target=_blank): так сканер лишається живим на своєму
+   домені — камера працює, список серійників на місці. Перехід у тій самій
+   вкладці цього не давав: сторінка опинялась у пісочниці Apps Script,
+   де камера заборонена, а сховище браузера вже інше. */
 function sendViaNavigation(url, payloadStr){
   const form = document.createElement('form');
   form.method = 'POST';
   form.action = url;
+  form.target = '_blank';
   form.enctype = 'application/x-www-form-urlencoded';
   form.style.display = 'none';
   const put = (n, v) => {
@@ -693,9 +704,9 @@ function sendViaNavigation(url, payloadStr){
   };
   put('payload', payloadStr);
   put('nav', '1');
-  put('back', location.href.split('#')[0]);
   document.body.appendChild(form);
   form.submit();
+  setTimeout(()=>{ try{ form.remove(); }catch(e){} }, 2000);
 }
 
 function sendViaHiddenForm(url, payloadStr){
@@ -774,11 +785,11 @@ els.send.addEventListener('click', async ()=>{
       els.sendMsg.textContent = 'Скрипт відповів помилкою: '+(out && out.error ? out.error : txt.slice(0,180));
     }
   }catch(e){
-    // Safari блокує запит із коду сторінки. Єдине, що він пропускає —
-    // перехід сторінки. Переходимо на скрипт, звідти повернешся кнопкою.
+    // Safari блокує запит із коду сторінки — надсилаємо формою в нову вкладку.
     persist();
-    els.sendMsg.textContent = 'Safari блокує фонове надсилання. Переходжу на сторінку скрипта…';
-    setTimeout(()=> sendViaNavigation(url, payloadStr), 400);
+    sendViaNavigation(url, payloadStr);
+    els.sendMsg.textContent = 'Надіслано '+rows.length+'. Результат — у новій вкладці. '
+      + 'Ця сторінка лишається робочою, список не втрачено.';
   }finally{ els.send.disabled = false; }
 });
 
@@ -848,6 +859,19 @@ async function decodeStill(bmp){
 }
 
 function log(m){ els.log.textContent = (m+'\n'+els.log.textContent).slice(0,900); }
+
+/* Якщо сторінка відкрилась у пісочниці Apps Script або в рамці, камера
+   буде заборонена, а сховище — інше. Показуємо це прямо, а не залишаємо
+   людину гадати, чому «серійники зникли». */
+const HOME_URL = 'https://rverstiuk-ship-it.github.io/sn-scanner/sn-scanner.html';
+(function checkOrigin(){
+  const bad = /google|googleusercontent/.test(location.hostname) || window.top !== window.self;
+  if (!bad) return;
+  const box = document.getElementById('wrongOrigin');
+  const link = document.getElementById('goHome');
+  if (box) box.hidden = false;
+  if (link){ link.href = HOME_URL; link.target = '_top'; }
+})();
 
 initDecoders().then(()=>{ restore(); showEndpointInfo(); renderDiag(); });
 </script>
