@@ -257,6 +257,8 @@ const state = {
   seq: 0,
   otherCodes: 0,
   hints: 0,
+  lastOther: '',        // останній не-серійник — щоб бачити, що саме ловиться
+  lastOtherBox: false,  // і чи прийшли з ним координати
   frames: 0,
   running: false,
 };
@@ -393,6 +395,8 @@ function renderDiag(){
     + (workerReady ? ' у фоні' : ' в основному потоці')
     + ' · ROI: '+lastRoi
     + ' · наведень: '+state.hints
+    + (state.lastOther ? ' · сторонній: '+state.lastOther.slice(0,18)
+        + (state.lastOtherBox ? ' +коорд' : ' БЕЗ КООРД') : '')
     + (canFilter ? ' · контраст є' : '')
     + ' · сторонніх кодів: '+state.otherCodes;
 }
@@ -459,7 +463,8 @@ async function initZbar(){
     zbarScanner = await window.zbarWasm.getDefaultScanner();
     zbarScanner.setConfig(ZB.NONE,    ZB.ENABLE,      0);   // вимкнути все
     zbarScanner.setConfig(ZB.CODE128, ZB.ENABLE,      1);   // лишити Code-128
-    zbarScanner.setConfig(ZB.CODE128, ZB.POSITION,    1);   // потрібні координати
+    zbarScanner.setConfig(ZB.CODE128, ZB.POSITION,    1);   // координати
+    zbarScanner.setConfig(ZB.NONE,    ZB.POSITION,    1);   // те саме глобально
     zbarScanner.setConfig(ZB.CODE128, ZB.UNCERTAINTY, 0);   // віддавати одразу
     zbarScanner.setConfig(ZB.NONE,    ZB.X_DENSITY,   1);
     zbarScanner.setConfig(ZB.NONE,    ZB.Y_DENSITY,   1);
@@ -633,6 +638,7 @@ try { importScripts('${ZXING_JS}'); } catch (e) {}
       zbarScanner.setConfig(0,   0,     0);      // вимкнути всі символіки
       zbarScanner.setConfig(128, 0,     1);      // лишити Code-128
       zbarScanner.setConfig(128, 0x80,  1);      // координати
+      zbarScanner.setConfig(0,   0x80,  1);      // те саме глобально
       zbarScanner.setConfig(128, 0x40,  0);      // віддавати одразу
       zbarScanner.setConfig(0,   0x100, 1);
       zbarScanner.setConfig(0,   0x101, 1);
@@ -913,14 +919,29 @@ const HINT_TTL = 14;                  // скільки кадрів трима�
 let hint = null;                      // {yc, h} у пікселях кадру
 let hintLeft = 0;
 
-function setHintFromDateCode(box){
-  if (!box) return;
-  const cpYc = lastGrab.sy + (box.y0 + box.y1) / 2 / lastGrab.scale;
-  const cpH  = Math.abs(box.y1 - box.y0) / lastGrab.scale;
-  if (cpH < 8) return;
-  hint = { yc: cpYc + 2.0 * cpH, h: Math.max(cpH * 2.4, 70) };
+function setHintFromDateCode(box, grab){
+  const g = grab || lastGrab;
+  if (box){
+    // Точне наведення: знаємо, де саме Date Code, а S/N рівно за 2.0 його
+    // висоти нижче (виміряно на двох коробках).
+    const cpYc = g.sy + (box.y0 + box.y1) / 2 / g.scale;
+    const cpH  = Math.abs(box.y1 - box.y0) / g.scale;
+    if (cpH >= 8){
+      hint = { yc: cpYc + 2.0 * cpH, h: Math.max(cpH * 2.4, 70) };
+      if (hintLeft === 0) state.hints++;
+      hintLeft = HINT_TTL;
+      return;
+    }
+  }
+  // Запасний варіант без координат: Date Code трапився десь у цій смузі,
+  // отже етикетка тут. Беремо ту саму смугу й проходимо її збільшеною —
+  // грубіше за точне наведення, але значно краще, ніж нічого.
+  const vh = els.vid.videoHeight || 0;
+  if (!vh) return;
+  const sh = Math.round(vh * ROI_H);
+  hint = { yc: g.sy + sh/2, h: sh };
   if (hintLeft === 0) state.hints++;
-  hintLeft = HINT_TTL;
+  hintLeft = Math.max(hintLeft, 6);
 }
 
 function grabHint(scale, boost){
@@ -1004,8 +1025,8 @@ async function loop(){
     // 3. Трапився Date Code — наводимось і пробуємо S/N ОДРАЗУ
     if (!hasSerial(found)){
       for (const f of r){
-        if (/^CP[0-9A-Z]{14}$/.test(f.text || '') && f.box){
-          setHintFromDateCode(f.box);
+        if (/^CP[0-9A-Z]{14}$/.test(f.text || '')){
+          setHintFromDateCode(f.box, lastGrab);
           const g2 = hintGeom();
           if (g2){ g2.hintMode = true;
             found = found.concat(await tryDecode(g2, 3, false, true)); }
@@ -1027,10 +1048,12 @@ async function loop(){
       if (add(t, 'скан') === 'new') hit = true;
     } else if (/^CP[0-9A-Z]{14}$/.test(t)){
       gauge(f.box, t);
-      setHintFromDateCode(f.box);
+      setHintFromDateCode(f.box, lastGrab);
       state.otherCodes++;
+      state.lastOther = t; state.lastOtherBox = !!f.box;
     } else {
       state.otherCodes++;
+      state.lastOther = t; state.lastOtherBox = !!f.box;
     }
   }
   if (sawSerial) hintLeft = Math.max(hintLeft, 4);
