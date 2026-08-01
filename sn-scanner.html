@@ -694,11 +694,14 @@ els.send.addEventListener('click', async ()=>{
   });
 
   // Спершу пробуємо fetch — тоді зможемо показати точну відповідь скрипта.
-  const fd = new FormData();
-  fd.append('payload', payloadStr);
+  // Тип application/x-www-form-urlencoded обрано свідомо: він "простий"
+  // (без preflight) І Apps Script гарантовано розбирає його в e.parameter.
+  // multipart/form-data від FormData Apps Script у e.parameter НЕ кладе.
+  const body = new URLSearchParams();
+  body.set('payload', payloadStr);
 
   try{
-    const res = await fetch(url, { method:'POST', body: fd });
+    const res = await fetch(url, { method:'POST', body: body });
     const txt = await res.text();
     let out; try{ out = JSON.parse(txt); }catch(e){ out = null; }
     if (out && out.ok){
