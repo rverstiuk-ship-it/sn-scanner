@@ -456,7 +456,7 @@ function zxingDecode(canvas){
   finally{ try{ zxingReader.reset(); }catch(e){} }
 }
 
-async function decodeCanvas(canvas){
+async function decodeCanvas(canvas, allowZxing){
   if (nativeDetector){
     try{
       const found = await nativeDetector.detect(canvas);
@@ -467,6 +467,9 @@ async function decodeCanvas(canvas){
   }
   const z = await zbarDecode(canvas);
   if (z) return z;
+  // ZXing на JS у рази повільніший за ZBar на WASM. Щоб не різати частоту
+  // опитування смуг, підключаємо його не щокадру.
+  if (allowZxing === false) return null;
   return zxingDecode(canvas);
 }
 
@@ -588,13 +591,16 @@ async function loop(){
 
   let res = null;
   const band = tick % ROI_BANDS.length;
+  const heavy = (tick % 3 === 0);          // чи підключати ZXing на цьому кадрі
   const c1 = grabRoi(1, band);
-  if (c1) res = await decodeCanvas(c1);
+  if (c1) res = await decodeCanvas(c1, heavy);
 
-  // рідше — важча спроба з апскейлом по центральній смузі
+  // Апскейл без згладжування зберігає різкі краї смуг і дає декодеру більше
+  // семплів на модуль — у тестах саме так брались межові штрихкоди.
+  // Але це найдорожча спроба, тому не щокадру.
   if (!res && tick % 6 === 0){
-    const c2 = grabRoi(2, 1);
-    if (c2) res = await decodeCanvas(c2);
+    const c2 = grabRoi(2, band);
+    if (c2) res = await decodeCanvas(c2, true);
   }
 
   let hit = false;
@@ -631,7 +637,44 @@ els.copy.addEventListener('click', async ()=>{
   }
 });
 
-/* ---------- Надсилання в Apps Script → Sheets + Telegram ---------- */
+/* POST звичайною формою в приховану рамку. Це навігація, а не XHR, тому
+   CORS до неї не застосовується взагалі — Safari не може її заблокувати.
+   Відповідь прочитати не можемо (інший домен), тому підтвердженням служить
+   повідомлення в Telegram, яке надсилає сам Apps Script. */
+function sendViaHiddenForm(url, payloadStr){
+  return new Promise(resolve=>{
+    const name = 'snsink_' + Date.now();
+    const ifr = document.createElement('iframe');
+    ifr.name = name;
+    ifr.setAttribute('aria-hidden','true');
+    ifr.style.cssText = 'position:absolute;left:-9999px;width:0;height:0;border:0';
+    document.body.appendChild(ifr);
+
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = url;
+    form.target = name;
+    form.enctype = 'application/x-www-form-urlencoded';
+    form.style.display = 'none';
+    const inp = document.createElement('input');
+    inp.type = 'hidden';
+    inp.name = 'payload';
+    inp.value = payloadStr;
+    form.appendChild(inp);
+    document.body.appendChild(form);
+
+    let done = false;
+    const finish = ok => {
+      if (done) return;
+      done = true;
+      setTimeout(()=>{ try{ form.remove(); ifr.remove(); }catch(e){} }, 800);
+      resolve(ok);
+    };
+    ifr.addEventListener('load', ()=> finish(true));
+    setTimeout(()=> finish(true), 12000);
+    form.submit();
+  });
+}
 els.send.addEventListener('click', async ()=>{
   const url = els.endpoint.value.trim();
   const secret = els.secret.value.trim();
@@ -644,36 +687,32 @@ els.send.addEventListener('click', async ()=>{
   els.send.disabled = true;
   els.sendMsg.textContent = 'Надсилаю '+rows.length+'…';
 
-  // FormData дає multipart-запит, який браузер вважає "простим" — без preflight.
-  // Safari інакше падає з "Load failed" на редіректі, яким відповідає Apps Script.
-  const fd = new FormData();
-  fd.append('payload', JSON.stringify({
+  const payloadStr = JSON.stringify({
     secret, batch: els.batch.value.trim(),
     expected: parseInt(els.expect.value,10) || null,
     count: rows.length, serials: rows
-  }));
+  });
+
+  // Спершу пробуємо fetch — тоді зможемо показати точну відповідь скрипта.
+  const fd = new FormData();
+  fd.append('payload', payloadStr);
 
   try{
     const res = await fetch(url, { method:'POST', body: fd });
     const txt = await res.text();
     let out; try{ out = JSON.parse(txt); }catch(e){ out = null; }
     if (out && out.ok){
-      els.sendMsg.textContent = 'Готово: додано '+out.added+', пропущено як дублікати '+out.skipped
+      els.sendMsg.textContent = 'Готово: додано '+out.added+', дублікатів '+out.skipped
         + (out.telegram ? ', у Telegram надіслано.' : ', але Telegram не відповів.');
     } else {
       els.sendMsg.textContent = 'Скрипт відповів помилкою: '+(out && out.error ? out.error : txt.slice(0,180));
     }
   }catch(e){
-    // Safari не дав прочитати відповідь. Надсилаємо ще раз "вслід" —
-    // дані дійдуть, підтвердження буде в Telegram і в таблиці.
-    try{
-      await fetch(url, { method:'POST', mode:'no-cors', body: fd });
-      els.sendMsg.textContent = 'Надіслано '+rows.length+'. Відповідь Safari прочитати не дав — '
-        + 'підтвердження дивись у Telegram і в таблиці.';
-    }catch(e2){
-      els.sendMsg.textContent = 'Не вдалося надіслати: '+e.message
-        + ' — перевір адресу /exec і що доступ "Будь-хто".';
-    }
+    // Safari заблокував читання — надсилаємо формою, її заблокувати не може.
+    els.sendMsg.textContent = 'Safari не дав прочитати відповідь, надсилаю формою…';
+    await sendViaHiddenForm(url, payloadStr);
+    els.sendMsg.textContent = 'Надіслано '+rows.length+' формою. '
+      + 'Підтвердження мусить прийти в Telegram — якщо не прийшло, скажи.';
   }finally{ els.send.disabled = false; }
 });
 
@@ -718,7 +757,7 @@ async function decodeStill(bmp){
   // 1) увесь кадр як є
   c.width = W; c.height = H;
   cx.drawImage(bmp, 0, 0);
-  let r = await decodeCanvas(c);
+  let r = await decodeCanvas(c, true);
   if (r && classify(r.text).ok) return r.text;
 
   // 2) горизонтальні смуги в нативній роздільності, з перекриттям
@@ -727,7 +766,7 @@ async function decodeStill(bmp){
     c.width = W; c.height = bandH;
     cx.imageSmoothingEnabled = false;
     cx.drawImage(bmp, 0, top, W, bandH, 0, 0, W, bandH);
-    r = await decodeCanvas(c);
+    r = await decodeCanvas(c, true);
     if (r && classify(r.text).ok) return r.text;
   }
 
@@ -736,7 +775,7 @@ async function decodeStill(bmp){
     c.width = W*2; c.height = bandH*2;
     cx.imageSmoothingEnabled = false;
     cx.drawImage(bmp, 0, top, W, bandH, 0, 0, W*2, bandH*2);
-    r = await decodeCanvas(c);
+    r = await decodeCanvas(c, true);
     if (r && classify(r.text).ok) return r.text;
   }
   return null;
