@@ -934,45 +934,91 @@ els.shot.addEventListener('change', async ()=>{
   }
 });
 
+/* Обробка повнорозмірного знімка (~3024×4032 проти 2160×3840 у прямому
+   потоці, плюс нормальний автофокус нативної камери).
+
+   Попередня версія читала спершу весь кадр цілком — 12 млн пікселів за
+   одне getImageData, і ще двічі по 12 смуг. Разом близько 100 млн
+   пікселів: Safari на телефоні або висне, або тихо валиться. Тому тепер:
+
+   1) смуги помірної висоти в нативній роздільності — шукаємо БУДЬ-ЯКІ коди;
+   2) якщо трапився Date Code — рахуємо за ним, де S/N (стало 2.0 висоти
+      нижче), вирізаємо тільки цю смугу й збільшуємо втричі;
+   3) якщо Date Code не знайшовся — проходимо смуги ще раз подвоєними.
+
+   Тут ми не обмежені швидкістю, тому можна дозволити собі точну роботу. */
 async function decodeStill(bmp){
   const W = bmp.width, H = bmp.height;
   log('знімок '+W+'×'+H);
   const c = document.createElement('canvas');
   const cx = c.getContext('2d', {willReadFrequently:true});
-  cx.imageSmoothingEnabled = false;
 
-  // з усіх знайдених кодів беремо той, що проходить перевірку серійника
-  const pick = list => {
+  const draw = (sy, sh, scale) => {
+    c.width  = Math.round(W*scale);
+    c.height = Math.round(sh*scale);
+    cx.imageSmoothingEnabled = false;
+    cx.drawImage(bmp, 0, sy, W, sh, 0, 0, c.width, c.height);
+  };
+  const pickSerial = list => {
     for (const f of (list || [])){
       const cl = classify(f.text);
       if (cl.ok) return cl.s;
     }
     return null;
   };
+  const findDateCode = list => {
+    for (const f of (list || [])){
+      if (/^CP[0-9A-Z]{14}$/.test(f.text || '') && f.box) return f.box;
+    }
+    return null;
+  };
 
-  // 1) увесь кадр як є
-  c.width = W; c.height = H;
-  cx.drawImage(bmp, 0, 0);
-  let got = pick(await decodeCanvas(c, true));
-  if (got) return got;
+  const bandH = Math.round(H*0.12);
+  const step  = Math.round(bandH*0.5);
 
-  // 2) горизонтальні смуги в нативній роздільності, з перекриттям
-  const bandH = Math.round(H*0.16);
-  for (let top = 0; top + bandH <= H; top += Math.round(bandH*0.5)){
-    c.width = W; c.height = bandH;
-    cx.imageSmoothingEnabled = false;
-    cx.drawImage(bmp, 0, top, W, bandH, 0, 0, W, bandH);
-    got = pick(await decodeCanvas(c, true));
-    if (got) return got;
+  // 1) прохід смугами в нативній роздільності
+  let dc = null, dcTop = 0;
+  for (let top = 0; top + bandH <= H; top += step){
+    els.shotBtn.textContent = 'Шукаю… ' + Math.round(top/H*100) + '%';
+    draw(top, bandH, 1);
+    const found = await decodeCanvas(c, true);
+    const sn = pickSerial(found);
+    if (sn) return sn;
+    if (!dc){
+      const box = findDateCode(found);
+      if (box){ dc = box; dcTop = top; }
+    }
+    await new Promise(r => setTimeout(r, 0));   // даємо браузеру дихати
   }
 
-  // 3) ті самі смуги, але вдвічі збільшені
-  for (let top = 0; top + bandH <= H; top += Math.round(bandH*0.5)){
-    c.width = W*2; c.height = bandH*2;
-    cx.imageSmoothingEnabled = false;
-    cx.drawImage(bmp, 0, top, W, bandH, 0, 0, W*2, bandH*2);
-    got = pick(await decodeCanvas(c, true));
-    if (got) return got;
+  // 2) знайшли Date Code — цілимось точно в S/N під ним і збільшуємо
+  if (dc){
+    const cpYc = dcTop + (dc.y0 + dc.y1)/2;
+    const cpH  = Math.abs(dc.y1 - dc.y0);
+    const snYc = cpYc + 2.0*cpH;
+    const snH  = Math.max(cpH*2.6, 90);
+    let sy = Math.round(snYc - snH/2), sh = Math.round(snH);
+    if (sy < 0){ sh += sy; sy = 0; }
+    if (sy + sh > H) sh = H - sy;
+    if (sh > 20){
+      log('наведення по Date Code: смуга '+sy+'..'+(sy+sh));
+      for (const sc of [3, 2]){
+        els.shotBtn.textContent = 'Уточнюю…';
+        draw(sy, sh, sc);
+        const sn = pickSerial(await decodeCanvas(c, true));
+        if (sn) return sn;
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+  }
+
+  // 3) запасний прохід — ті самі смуги подвоєними
+  for (let top = 0; top + bandH <= H; top += step){
+    els.shotBtn.textContent = 'Ще раз… ' + Math.round(top/H*100) + '%';
+    draw(top, bandH, 2);
+    const sn = pickSerial(await decodeCanvas(c, true));
+    if (sn) return sn;
+    await new Promise(r => setTimeout(r, 0));
   }
   return null;
 }
