@@ -669,14 +669,34 @@ els.ping.addEventListener('click', ()=>{
     els.sendMsg.textContent = 'Спершу виправ адресу — вона має закінчуватись на /exec';
     fbWarn(); return;
   }
-  const ifr = document.createElement('iframe');
-  ifr.style.cssText = 'position:absolute;left:-9999px;width:0;height:0;border:0';
-  ifr.src = u + '?ping=1';
-  document.body.appendChild(ifr);
-  setTimeout(()=>{ try{ ifr.remove(); }catch(e){} }, 8000);
-  els.sendMsg.textContent = 'Запит пішов. Подивись у таблиці аркуш «_Лог» — '
-    + 'там має з\'явитись рядок з поміткою GET.';
+  persist();
+  // саме перехід, а не запит із коду — інакше Safari не пропустить
+  location.href = u + '?ping=1&back=' + encodeURIComponent(location.href.split('#')[0]);
 });
+
+/* Safari блокує будь-які міжсайтові запити З КОДУ сторінки (fetch, форма в
+   рамку) — перевірено: ті самі адреси з адресного рядка проходять, а зі
+   сторінки ні. Не блокується лише НАВІГАЦІЯ. Тому надсилаємо справжньою
+   формою без target: браузер переходить на сторінку скрипта, той приймає
+   дані й показує результат із кнопкою повернення.
+   Список не втрачається — він збережений у пам'яті телефона. */
+function sendViaNavigation(url, payloadStr){
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = url;
+  form.enctype = 'application/x-www-form-urlencoded';
+  form.style.display = 'none';
+  const put = (n, v) => {
+    const i = document.createElement('input');
+    i.type = 'hidden'; i.name = n; i.value = v;
+    form.appendChild(i);
+  };
+  put('payload', payloadStr);
+  put('nav', '1');
+  put('back', location.href.split('#')[0]);
+  document.body.appendChild(form);
+  form.submit();
+}
 
 function sendViaHiddenForm(url, payloadStr){
   return new Promise(resolve=>{
@@ -754,11 +774,11 @@ els.send.addEventListener('click', async ()=>{
       els.sendMsg.textContent = 'Скрипт відповів помилкою: '+(out && out.error ? out.error : txt.slice(0,180));
     }
   }catch(e){
-    // Safari заблокував читання — надсилаємо формою, її заблокувати не може.
-    els.sendMsg.textContent = 'Safari не дав прочитати відповідь, надсилаю формою…';
-    await sendViaHiddenForm(url, payloadStr);
-    els.sendMsg.textContent = 'Надіслано '+rows.length+' формою. '
-      + 'Підтвердження мусить прийти в Telegram — якщо не прийшло, скажи.';
+    // Safari блокує запит із коду сторінки. Єдине, що він пропускає —
+    // перехід сторінки. Переходимо на скрипт, звідти повернешся кнопкою.
+    persist();
+    els.sendMsg.textContent = 'Safari блокує фонове надсилання. Переходжу на сторінку скрипта…';
+    setTimeout(()=> sendViaNavigation(url, payloadStr), 400);
   }finally{ els.send.disabled = false; }
 });
 
