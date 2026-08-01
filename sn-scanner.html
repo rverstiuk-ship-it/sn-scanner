@@ -214,7 +214,7 @@
 
   <fieldset>
     <legend>Партія та надсилання</legend>
-    <label for="who">Хто сканує</label>
+    <label for="who">Хто сканує <span style="color:var(--alert)">обов'язково</span></label>
     <input id="who" placeholder="ім'я" autocomplete="off" autocapitalize="words">
     <label for="batch">Назва партії</label>
     <input id="batch" placeholder="напр. LANDWEST PF/1/1605/2025" autocomplete="off">
@@ -760,6 +760,15 @@ els.send.addEventListener('click', async ()=>{
   const url = ENDPOINT;
   const secret = SECRET;
   if (!state.serials.size){ els.sendMsg.textContent='Спершу відскануй хоч один серійник.'; return; }
+  if (!els.who.value.trim()){
+    els.sendMsg.textContent = 'Впиши, хто сканує — без цього не видно, чий це прийом.';
+    els.who.style.borderColor = 'var(--alert)';
+    els.who.focus();
+    els.who.scrollIntoView({ block:'center', behavior:'smooth' });
+    fbWarn();
+    setTimeout(()=>{ els.who.style.borderColor=''; }, 2500);
+    return;
+  }
   if (!RE_EXEC.test(url)){
     els.sendMsg.textContent = '⚠️ Прошита адреса приймача неправильна. '
       + 'Виправ константу ENDPOINT у файлі сканера й перезалий його.';
