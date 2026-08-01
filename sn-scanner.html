@@ -256,6 +256,7 @@ const state = {
   serials: new Map(),   // serial -> {seq, ts, src, flag}
   seq: 0,
   otherCodes: 0,
+  hints: 0,
   frames: 0,
   running: false,
 };
@@ -380,6 +381,7 @@ function renderDiag(){
     'кадрів: '+state.frames
     + ' · декодери: '+(dec.join('+') || 'НЕМАЄ')
     + ' · ROI: '+lastRoi
+    + ' · наведень: '+state.hints
     + ' · сторонніх кодів: '+state.otherCodes;
 }
 function renderAll(){ renderTally(); renderList(); renderDiag(); }
@@ -438,25 +440,37 @@ async function initDecoders(){
   if (!nativeDetector && !zxingReader) log('Жоден декодер не доступний.');
 }
 
-/* ZBar через WebAssembly. Обгорнутий у try/catch повністю: якщо бібліотека
-   не підвантажилась або API інший — просто повертає null, решта працює. */
-async function zbarDecode(canvas){
-  if (!zbarReady) return null;
+/* ZBar через WebAssembly. Повертає ВСІ знайдені коди разом з їхньою
+   геометрією — вона потрібна для наведення (див. нижче про Date Code).
+   Обгорнутий у try/catch: якщо бібліотека не підвантажилась або API інший,
+   просто повертає порожньо, решта працює. */
+async function zbarScan(canvas){
+  if (!zbarReady) return [];
   try{
     const ctx = canvas.getContext('2d', {willReadFrequently:true});
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const syms = await window.zbarWasm.scanImageData(data);
-    if (!syms || !syms.length) return null;
-    for (const s of syms){
+    const out = [];
+    for (const s of (syms || [])){
       let text = '';
       try{ text = s.decode(); }catch(e){ text = s.data ? String(s.data) : ''; }
-      if (text) return { text: text, width: 0 };
+      if (!text) continue;
+      let box = null;
+      try{
+        const pts = s.points || [];
+        if (pts.length){
+          const xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
+          box = { x0:Math.min.apply(null,xs), x1:Math.max.apply(null,xs),
+                  y0:Math.min.apply(null,ys), y1:Math.max.apply(null,ys) };
+        }
+      }catch(e){}
+      out.push({ text: text, box: box });
     }
-    return null;
+    return out;
   }catch(e){
     zbarReady = false;             // більше не пробуємо, щоб не гальмувати цикл
     log('zbar-wasm вимкнено: '+e.message);
-    return null;
+    return [];
   }
 }
 
@@ -473,35 +487,44 @@ function zxingDecode(canvas){
     const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
     const res = zxingReader.decode(bmp);
     if (!res) return null;
-    let width = 0;
+    let box = null;
     try{
-      const pts = res.getResultPoints().map(p=>p.getX());
-      width = Math.max(...pts) - Math.min(...pts);
+      const pts = res.getResultPoints();
+      const xs = pts.map(p=>p.getX()), ys = pts.map(p=>p.getY());
+      box = { x0:Math.min.apply(null,xs), x1:Math.max.apply(null,xs),
+              y0:Math.min.apply(null,ys), y1:Math.max.apply(null,ys) };
     }catch(e){}
-    return { text: res.getText(), width: width };
+    return { text: res.getText(), box: box };
   }catch(e){ return null; }
   finally{ try{ zxingReader.reset(); }catch(e){} }
 }
 
+/* Повертає список знайдених кодів. Порядок рушіїв: нативний (Android),
+   ZBar на WASM (швидкий), ZXing на JS (повільний, тому не щокадру). */
 async function decodeCanvas(canvas, allowZxing){
   if (nativeDetector){
     try{
       const found = await nativeDetector.detect(canvas);
+      const out = [];
       for (const b of found){
-        if (b.rawValue) return { text:b.rawValue, width:(b.boundingBox? b.boundingBox.width : 0) };
+        if (!b.rawValue) continue;
+        const bb = b.boundingBox;
+        out.push({ text:b.rawValue,
+                   box: bb ? {x0:bb.x, x1:bb.x+bb.width, y0:bb.y, y1:bb.y+bb.height} : null });
       }
+      if (out.length) return out;
     }catch(e){}
   }
-  const z = await zbarDecode(canvas);
-  if (z) return z;
-  // ZXing на JS у рази повільніший за ZBar на WASM. Щоб не різати частоту
-  // опитування смуг, підключаємо його не щокадру.
-  if (allowZxing === false) return null;
-  return zxingDecode(canvas);
+  const z = await zbarScan(canvas);
+  if (z.length) return z;
+  if (allowZxing === false) return [];
+  const x = zxingDecode(canvas);
+  return x ? [x] : [];
 }
 
 /* ---------- Камера ---------- */
 let stream=null, track=null, rafTimer=null, tick=0;
+let lastGrab = { sy:0, scale:1 };     // де саме взяли останній кадр — для наведення
 const work = document.createElement('canvas');
 const wctx = work.getContext('2d', {willReadFrequently:true});
 wctx.imageSmoothingEnabled = false;   // різкі краї смуг важливіші за згладжування
@@ -564,6 +587,7 @@ function stopCamera(){
   els.hint.hidden = true;
   els.live.hidden = true;
   els.gauge.className = 'gauge';
+  hint = null; hintLeft = 0;
   els.stop.disabled = els.torch.disabled = true;
   els.off.querySelector('p').textContent = 'Камера вимкнена.';
   els.start.textContent = 'Увімкнути камеру';
@@ -587,22 +611,65 @@ function grabRoi(scale, bandIdx){
   wctx.imageSmoothingEnabled = false;
   wctx.drawImage(els.vid, 0, sy, vw, sh, 0, 0, work.width, work.height);
   lastRoi = vw+'×'+sh + ' смуга '+(bandIdx % ROI_BANDS.length + 1) + (scale!==1?(' ×'+scale):'');
+  lastGrab = { sy: sy, scale: scale };
   return work;
 }
 
-/* Date Code (16 симв = 211 модулів) декодується легко навіть здалеку,
-   тому використовуємо його як далекомір: за його шириною рахуємо, скільки
-   пікселів на модуль буде у S/N (20 симв = 255 модулів, така ж друкована
-   ширина). Менше 2.4 — треба підійти ближче. */
-function gauge(res){
-  if (!res || !res.width) return;
-  const t = res.text || '';
-  let modules = null;
-  if (/^CP[0-9A-Z]{14}$/.test(t)) modules = 211;      // Date Code
-  else if (t.startsWith('1581')) modules = 255;       // сам S/N
-  if (!modules) return;
-  // перерахунок на щільність S/N
-  const pxPerModuleSN = (res.width / modules) * (modules / 255);
+/* ============================================================
+   НАВЕДЕННЯ ПО DATE CODE
+
+   Date Code (16 символів) на ~20% рідший за S/N (20 символів) і тому
+   декодується легко навіть тоді, коли S/N ще не береться — за сесію
+   його ловило по 250+ разів. А на етикетці DJI він стоїть строго над
+   S/N, і відстань стала: виміряно на двох різних коробках — центр S/N
+   рівно за 2.0 висоти штрихкоду Date Code нижче його центру, сама
+   смуга S/N заввишки ~1.33 такої висоти.
+
+   Тож щойно спіймали Date Code — рахуємо, де саме зараз S/N, і
+   наступні кадри б'ємо точно туди, збільшуючи вдвічі. Замість того,
+   щоб наосліп перебирати смуги.
+   ============================================================ */
+const HINT_TTL = 14;                  // скільки кадрів тримати наведення
+let hint = null;                      // {yc, h} у пікселях кадру
+let hintLeft = 0;
+
+function setHintFromDateCode(box){
+  if (!box) return;
+  const cpYc = lastGrab.sy + (box.y0 + box.y1) / 2 / lastGrab.scale;
+  const cpH  = Math.abs(box.y1 - box.y0) / lastGrab.scale;
+  if (cpH < 8) return;
+  hint = { yc: cpYc + 2.0 * cpH, h: Math.max(cpH * 2.4, 70) };
+  if (hintLeft === 0) state.hints++;
+  hintLeft = HINT_TTL;
+}
+
+function grabHint(scale){
+  const vw = els.vid.videoWidth, vh = els.vid.videoHeight;
+  if (!vw || !vh || !hint) return null;
+  let sy = Math.round(hint.yc - hint.h/2);
+  let sh = Math.round(hint.h);
+  if (sy < 0){ sh += sy; sy = 0; }
+  if (sy + sh > vh) sh = vh - sy;
+  if (sh < 20) return null;
+  work.width  = Math.round(vw*scale);
+  work.height = Math.round(sh*scale);
+  wctx.imageSmoothingEnabled = false;
+  wctx.drawImage(els.vid, 0, sy, vw, sh, 0, 0, work.width, work.height);
+  lastRoi = vw+'×'+sh + ' наведення ×'+scale;
+  lastGrab = { sy: sy, scale: scale };
+  return work;
+}
+
+/* Далекомір: за шириною Date Code рахуємо, скільки пікселів на модуль
+   випаде на S/N (211 модулів проти 255 за тієї ж друкованої ширини). */
+function gauge(box, text){
+  if (!box) return;
+  const w = Math.abs(box.x1 - box.x0) / lastGrab.scale;
+  if (!w) return;
+  let pxPerModuleSN = null;
+  if (/^CP[0-9A-Z]{14}$/.test(text)) pxPerModuleSN = w / 255;
+  else if (text.indexOf('1581') === 0) pxPerModuleSN = w / 255;
+  if (pxPerModuleSN === null) return;
   if (pxPerModuleSN < 2.4){
     els.gauge.textContent = 'ближче';
     els.gauge.className = 'gauge near';
@@ -616,28 +683,50 @@ async function loop(){
   if (!state.running) return;
   state.frames++; tick++;
 
-  let res = null;
-  const band = tick % ROI_BANDS.length;
-  const heavy = (tick % 3 === 0);          // чи підключати ZXing на цьому кадрі
-  const c1 = grabRoi(1, band);
-  if (c1) res = await decodeCanvas(c1, heavy);
+  let found = [];
 
-  // Апскейл без згладжування зберігає різкі краї смуг і дає декодеру більше
-  // семплів на модуль — у тестах саме так брались межові штрихкоди.
-  // Але це найдорожча спроба, тому не щокадру.
-  if (!res && tick % 6 === 0){
-    const c2 = grabRoi(2, band);
-    if (c2) res = await decodeCanvas(c2, true);
+  // 1. Якщо наведення активне — б'ємо точно в очікувану смугу S/N,
+  //    вдвічі збільшену. Смуга вузька, тому це не дорожче за звичайний кадр.
+  if (hintLeft > 0){
+    hintLeft--;
+    const ch = grabHint(2);
+    if (ch) found = await decodeCanvas(ch, true);
+  }
+
+  // 2. Інакше (або якщо наведення не спрацювало) — звичайний перебір смуг.
+  if (!found.length){
+    const band = tick % ROI_BANDS.length;
+    const heavy = (tick % 3 === 0);        // ZXing повільний, не щокадру
+    const c1 = grabRoi(1, band);
+    if (c1) found = await decodeCanvas(c1, heavy);
+
+    if (!found.length && tick % 6 === 0){
+      const c2 = grabRoi(2, band);
+      if (c2) found = await decodeCanvas(c2, true);
+    }
   }
 
   let hit = false;
-  if (res){
-    gauge(res);
-    hit = add(res.text, 'скан') === 'new';
+  let sawSerial = false;
+  for (const f of found){
+    const t = f.text || '';
+    if (t.indexOf('1581') === 0){
+      sawSerial = true;
+      gauge(f.box, t);
+      if (add(t, 'скан') === 'new') hit = true;
+    } else if (/^CP[0-9A-Z]{14}$/.test(t)){
+      gauge(f.box, t);
+      setHintFromDateCode(f.box);        // ось воно — навелись на S/N
+      state.otherCodes++;
+    } else {
+      state.otherCodes++;
+    }
   }
+  if (sawSerial) hintLeft = Math.max(hintLeft, 4);   // тримаємось етикетки
+
   if (state.frames % 10 === 0) renderDiag();
 
-  rafTimer = setTimeout(loop, hit ? 550 : 90);   // пауза після влучання, щоб не дублювати
+  rafTimer = setTimeout(loop, hit ? 550 : 70);   // пауза після влучання, щоб не дублювати
 }
 
 /* ---------- Ліхтар ---------- */
@@ -852,11 +941,20 @@ async function decodeStill(bmp){
   const cx = c.getContext('2d', {willReadFrequently:true});
   cx.imageSmoothingEnabled = false;
 
+  // з усіх знайдених кодів беремо той, що проходить перевірку серійника
+  const pick = list => {
+    for (const f of (list || [])){
+      const cl = classify(f.text);
+      if (cl.ok) return cl.s;
+    }
+    return null;
+  };
+
   // 1) увесь кадр як є
   c.width = W; c.height = H;
   cx.drawImage(bmp, 0, 0);
-  let r = await decodeCanvas(c, true);
-  if (r && classify(r.text).ok) return r.text;
+  let got = pick(await decodeCanvas(c, true));
+  if (got) return got;
 
   // 2) горизонтальні смуги в нативній роздільності, з перекриттям
   const bandH = Math.round(H*0.16);
@@ -864,8 +962,8 @@ async function decodeStill(bmp){
     c.width = W; c.height = bandH;
     cx.imageSmoothingEnabled = false;
     cx.drawImage(bmp, 0, top, W, bandH, 0, 0, W, bandH);
-    r = await decodeCanvas(c, true);
-    if (r && classify(r.text).ok) return r.text;
+    got = pick(await decodeCanvas(c, true));
+    if (got) return got;
   }
 
   // 3) ті самі смуги, але вдвічі збільшені
@@ -873,8 +971,8 @@ async function decodeStill(bmp){
     c.width = W*2; c.height = bandH*2;
     cx.imageSmoothingEnabled = false;
     cx.drawImage(bmp, 0, top, W, bandH, 0, 0, W*2, bandH*2);
-    r = await decodeCanvas(c, true);
-    if (r && classify(r.text).ok) return r.text;
+    got = pick(await decodeCanvas(c, true));
+    if (got) return got;
   }
   return null;
 }
