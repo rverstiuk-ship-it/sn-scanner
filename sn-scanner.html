@@ -214,19 +214,12 @@
 
   <fieldset>
     <legend>Партія та надсилання</legend>
+    <label for="who">Хто сканує</label>
+    <input id="who" placeholder="ім'я" autocomplete="off" autocapitalize="words">
     <label for="batch">Назва партії</label>
     <input id="batch" placeholder="напр. LANDWEST PF/1/1605/2025" autocomplete="off">
     <label for="expect">Скільки коробок очікується</label>
     <input id="expect" inputmode="numeric" placeholder="50" autocomplete="off">
-    <label for="endpoint">Адреса Apps Script (/exec)</label>
-    <input id="endpoint" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
-    <label for="secret">Спільний ключ</label>
-    <input id="secret" placeholder="той самий, що в скрипті" autocomplete="off">
-    <p class="hint" id="epInfo"></p>
-    <div class="row" style="margin-top:10px">
-      <button id="ping">Перевірити зв'язок</button>
-    </div>
-    <p class="hint">Адреса й ключ зберігаються лише на цьому телефоні. Токен Telegram-бота тут не потрібен — його тримає Apps Script.</p>
     <div class="row" style="margin-top:12px">
       <button id="copy">Копіювати список</button>
       <button class="primary" id="send">Надіслати в Sheets + Telegram</button>
@@ -237,6 +230,10 @@
   <details>
     <summary>Діагностика</summary>
     <div class="stat" id="diag">—</div>
+    <div class="row" style="margin-top:10px">
+      <button id="ping">Перевірити зв'язок</button>
+    </div>
+    <p class="hint" id="epInfo"></p>
     <p id="log"></p>
   </details>
 
@@ -273,7 +270,7 @@ const els = {
   last:$('last'), lastTag:$('lastTag'), readout:$('readout'),
   items:$('items'), emptyNote:$('emptyNote'), cnt:$('cnt'), target:$('target'), fill:$('fill'),
   manual:$('manual'), addManual:$('addManual'), clear:$('clear'),
-  batch:$('batch'), expect:$('expect'), endpoint:$('endpoint'), secret:$('secret'),
+  who:$('who'), batch:$('batch'), expect:$('expect'),
   copy:$('copy'), send:$('send'), sendMsg:$('sendMsg'), diag:$('diag'), log:$('log'),
   shotBtn:$('shotBtn'), shot:$('shot'), ping:$('ping'), epInfo:$('epInfo'),
 };
@@ -291,12 +288,12 @@ function restore(){
   const s = store.get('serials', null);
   if (Array.isArray(s)) state.serials = new Map(s);
   state.seq = store.get('seq', state.serials.size);
-  ['batch','expect','endpoint','secret'].forEach(k=>{
+  ['who','batch','expect'].forEach(k=>{
     const v = store.get(k, ''); if (v) els[k].value = v;
   });
   renderAll();
 }
-['batch','expect','endpoint','secret'].forEach(k=>{
+['who','batch','expect'].forEach(k=>{
   els[k].addEventListener('change', ()=>{ store.set(k, els[k].value.trim()); if(k==='expect') renderTally(); });
 });
 
@@ -676,28 +673,26 @@ els.copy.addEventListener('click', async ()=>{
    Тому перевіряємо форму адреси і показуємо її хвіст, щоб обрізання було видно. */
 const RE_EXEC = /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/;
 
+/* Адреса приймача і спільний ключ прошиті тут, щоб не займати місце на
+   екрані. Якщо колись зміниться розгортання Apps Script (нова адреса) —
+   правити треба саме ці два рядки й перезалити файл. */
+const ENDPOINT = 'https://script.google.com/macros/s/AKfycbyqhyDJ2zFQC5asCvkLTxU2CyZ38pX8Ioh_g5cGAo9-vfjI4m1Gb3Bmn83I6neKryVl/exec';
+const SECRET   = 'sn-rtfc-2026-Kx7mQ9vT4pLw';
+
 function showEndpointInfo(){
-  const u = els.endpoint.value.trim();
-  if (!u){ els.epInfo.textContent = 'Адресу не вписано.'; return; }
-  const tail = u.length > 18 ? '…' + u.slice(-18) : u;
-  els.epInfo.textContent = RE_EXEC.test(u)
-    ? 'Адреса виглядає правильно · ' + u.length + ' символів · закінчується на ' + tail
-    : '⚠️ Адреса неправильна — має закінчуватись на /exec · зараз ' + u.length + ' символів · ' + tail;
+  const tail = '…' + ENDPOINT.slice(-18);
+  els.epInfo.textContent = RE_EXEC.test(ENDPOINT)
+    ? 'Приймач: ' + ENDPOINT.length + ' символів, закінчується на ' + tail
+    : '⚠️ Прошита адреса неправильна — виправ константу ENDPOINT у файлі.';
 }
-els.endpoint.addEventListener('input', showEndpointInfo);
 
 /* Відкриває адресу в прихованій рамці звичайним GET. Прочитати відповідь
    Safari не дасть, але запит долетить і залишить рядок в аркуші «_Лог» —
    так видно, чи саме ЦЯ збережена адреса робоча. */
 els.ping.addEventListener('click', ()=>{
-  const u = els.endpoint.value.trim();
-  if (!RE_EXEC.test(u)){
-    els.sendMsg.textContent = 'Спершу виправ адресу — вона має закінчуватись на /exec';
-    fbWarn(); return;
-  }
   persist();
   // нова вкладка, а не перехід — інакше сканер опиниться в пісочниці скрипта
-  window.open(u + '?ping=1', '_blank');
+  window.open(ENDPOINT + '?ping=1', '_blank');
   els.sendMsg.textContent = 'Відкрив перевірку в новій вкладці. Якщо там сторінка «ПРИЙНЯТО» — канал робочий.';
 });
 
@@ -762,13 +757,12 @@ function sendViaHiddenForm(url, payloadStr){
   });
 }
 els.send.addEventListener('click', async ()=>{
-  const url = els.endpoint.value.trim();
-  const secret = els.secret.value.trim();
+  const url = ENDPOINT;
+  const secret = SECRET;
   if (!state.serials.size){ els.sendMsg.textContent='Спершу відскануй хоч один серійник.'; return; }
-  if (!url){ els.sendMsg.textContent='Впиши адресу Apps Script (/exec).'; return; }
   if (!RE_EXEC.test(url)){
-    els.sendMsg.textContent = '⚠️ Адреса неправильна ('+url.length+' симв.). Має бути вигляду '
-      + 'https://script.google.com/macros/s/…/exec — схоже, вона обрізалась при вставці.';
+    els.sendMsg.textContent = '⚠️ Прошита адреса приймача неправильна. '
+      + 'Виправ константу ENDPOINT у файлі сканера й перезалий його.';
     fbWarn();
     return;
   }
@@ -780,7 +774,7 @@ els.send.addEventListener('click', async ()=>{
   els.sendMsg.textContent = 'Надсилаю '+rows.length+'…';
 
   const payloadStr = JSON.stringify({
-    secret, batch: els.batch.value.trim(),
+    secret, who: els.who.value.trim(), batch: els.batch.value.trim(),
     expected: parseInt(els.expect.value,10) || null,
     count: rows.length, serials: rows
   });
