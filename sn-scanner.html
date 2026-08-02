@@ -252,7 +252,7 @@
    ============================================================ */
 /* Позначка збірки. Видно в «Діагностиці» — так одразу зрозуміло, чи
    на телефоні справді свіжий файл, чи Safari віддає старий із кешу. */
-const BUILD = 'b14 · наведення без координат';
+const BUILD = 'b15 · тільки Code-128';
 
 const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
 
@@ -460,13 +460,18 @@ const ZB = {
   NONE:0, CODE128:128,
   ENABLE:0, UNCERTAINTY:0x40, POSITION:0x80, X_DENSITY:0x100, Y_DENSITY:0x101
 };
+/* Вимикаємо кожну символіку ПОІМЕННО. Виклик з нульовим символом
+   («вимкнути все») не спрацював — діагностика показала, що ZBar далі
+   віддавав UPC. Числа — стандартні коди типів ZBar. */
+const ZB_OTHERS = [2,5,8,9,10,12,13,14,15,25,34,35,38,39,57,64,80,93];
 let zbarScanner = null;
 
 async function initZbar(){
   if (!window.zbarWasm) return false;
   try{
     zbarScanner = await window.zbarWasm.getDefaultScanner();
-    zbarScanner.setConfig(ZB.NONE,    ZB.ENABLE,      0);   // вимкнути все
+    zbarScanner.setConfig(ZB.NONE,    ZB.ENABLE,      0);   // спроба вимкнути все
+    for (const t of ZB_OTHERS) zbarScanner.setConfig(t, ZB.ENABLE, 0);
     zbarScanner.setConfig(ZB.CODE128, ZB.ENABLE,      1);   // лишити Code-128
     zbarScanner.setConfig(ZB.CODE128, ZB.POSITION,    1);   // координати
     zbarScanner.setConfig(ZB.NONE,    ZB.POSITION,    1);   // те саме глобально
@@ -521,6 +526,11 @@ async function zbarScan(canvas){
     const syms = await window.zbarWasm.scanImageData(data, zbarScanner);
     const out = [];
     for (const s of (syms || [])){
+      // Другий рубіж: навіть якщо налаштування не подіяли, беремо лише
+      // Code-128 — усе інше на етикетці нам тільки заважає.
+      const ty = (typeof s.type === 'number') ? s.type : null;
+      const tn = String(s.typeName || '');
+      if (ty !== null ? ty !== 128 : tn.indexOf('128') < 0) continue;
       let text = '';
       try{ text = s.decode(); }catch(e){ text = s.data ? String(s.data) : ''; }
       if (!text) continue;
@@ -640,7 +650,11 @@ try { importScripts('${ZXING_JS}'); } catch (e) {}
         self.zbarWasm.setModuleArgs({ locateFile: () => '${ZBAR_WASM}' });
       }
       zbarScanner = await self.zbarWasm.getDefaultScanner();
-      zbarScanner.setConfig(0,   0,     0);      // вимкнути всі символіки
+      zbarScanner.setConfig(0, 0, 0);            // спроба вимкнути все
+      // і поіменно, бо виклик вище виявився недієвим
+      for (const t of [2,5,8,9,10,12,13,14,15,25,34,35,38,39,57,64,80,93]){
+        try{ zbarScanner.setConfig(t, 0, 0); }catch(e){}
+      }
       zbarScanner.setConfig(128, 0,     1);      // лишити Code-128
       zbarScanner.setConfig(128, 0x80,  1);      // координати
       zbarScanner.setConfig(0,   0x80,  1);      // те саме глобально
@@ -693,6 +707,9 @@ async function zbarOn(imgData){
     const syms = await self.zbarWasm.scanImageData(imgData, zbarScanner);
     const out = [];
     for (const s of (syms || [])){
+      const ty = (typeof s.type === 'number') ? s.type : null;
+      const tn = String(s.typeName || '');
+      if (ty !== null ? ty !== 128 : tn.indexOf('128') < 0) continue;
       let text = '';
       try{ text = s.decode(); }catch(e){}
       if (!text) continue;
