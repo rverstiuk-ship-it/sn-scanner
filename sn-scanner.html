@@ -252,9 +252,24 @@
    ============================================================ */
 /* Позначка збірки. Видно в «Діагностиці» — так одразу зрозуміло, чи
    на телефоні справді свіжий файл, чи Safari віддає старий із кешу. */
-const BUILD = 'b15 · тільки Code-128';
+const BUILD = 'b16 · Date Code без префікса';
 
 const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
+
+/* Date Code — це просто ДРУГИЙ Code-128 на етикетці, той, що над S/N.
+   Прив'язка до префікса не працює: на різних партіях він то CP, то CN.
+   А оскільки все, крім Code-128, ми вже відфільтрували, правило стає
+   надійним: будь-який Code-128, що не є серійником, — це Date Code.
+   Довжина 14–18 відсікає випадкове сміття. */
+/* Date Code на етикетці DJI починається по-різному — трапляються і CP…,
+   і CN… Тому префікс НЕ перевіряємо: оскільки декодується лише Code-128,
+   будь-який код, що не є серійником, — це і є Date Code. Саме зашитий
+   префікс «CP» і був причиною того, що наведення мовчало на коробках CN. */
+function isDateCode(t){
+  const x = String(t || '');
+  return !RE_SERIAL.test(x.toUpperCase().replace(/O/g,'0'))
+         && x.length >= 12 && x.length <= 18;
+}
 
 const state = {
   serials: new Map(),   // serial -> {seq, ts, src, flag}
@@ -993,10 +1008,9 @@ function gauge(box, text){
   if (!box) return;
   const w = Math.abs(box.x1 - box.x0) / lastGrab.scale;
   if (!w) return;
-  let pxPerModuleSN = null;
-  if (/^CP[0-9A-Z]{14}$/.test(text)) pxPerModuleSN = w / 255;
-  else if (text.indexOf('1581') === 0) pxPerModuleSN = w / 255;
-  if (pxPerModuleSN === null) return;
+  // Date Code і S/N мають однакову друковану ширину, тому щільність
+  // майбутнього S/N рахуємо однаково для обох.
+  const pxPerModuleSN = w / 255;
   if (pxPerModuleSN < 2.4){
     els.gauge.textContent = 'ближче';
     els.gauge.className = 'gauge near';
@@ -1047,7 +1061,7 @@ async function loop(){
     // 3. Трапився Date Code — наводимось і пробуємо S/N ОДРАЗУ
     if (!hasSerial(found)){
       for (const f of r){
-        if (/^CP[0-9A-Z]{14}$/.test(f.text || '')){
+        if (isDateCode(f.text)){
           setHintFromDateCode(f.box, lastGrab);
           const g2 = hintGeom();
           if (g2){ g2.hintMode = true;
@@ -1068,7 +1082,7 @@ async function loop(){
       sawSerial = true;
       gauge(f.box, t);
       if (add(t, 'скан') === 'new') hit = true;
-    } else if (/^CP[0-9A-Z]{14}$/.test(t)){
+    } else if (isDateCode(t)){
       gauge(f.box, t);
       setHintFromDateCode(f.box, lastGrab);
       state.otherCodes++;
@@ -1317,7 +1331,7 @@ async function decodeStill(bmp){
   };
   const findDateCode = list => {
     for (const f of (list || [])){
-      if (/^CP[0-9A-Z]{14}$/.test(f.text || '') && f.box) return f.box;
+      if (isDateCode(f.text) && f.box) return f.box;
     }
     return null;
   };
