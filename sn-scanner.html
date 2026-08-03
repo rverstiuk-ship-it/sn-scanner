@@ -76,6 +76,7 @@
     text-transform:uppercase;padding:5px 9px;opacity:0;transition:opacity .2s}
   .gauge.near{opacity:1;background:var(--alert);color:var(--ink)}
   .gauge.good{opacity:1;background:var(--cyan);color:var(--ink)}
+  .gauge.hold{opacity:1;background:var(--amber);color:var(--ink)}
   .live{position:absolute;top:10px;right:10px;display:flex;align-items:center;gap:6px;font-size:10.5px;
     letter-spacing:.14em;text-transform:uppercase;color:var(--paper);text-shadow:0 1px 3px #000}
   .live b{width:8px;height:8px;border-radius:50%;background:var(--cyan);animation:pulse 1.1s infinite}
@@ -252,7 +253,7 @@
    ============================================================ */
 /* Позначка збірки. Видно в «Діагностиці» — так одразу зрозуміло, чи
    на телефоні справді свіжий файл, чи Safari віддає старий із кешу. */
-const BUILD = 'b19 · фото в Telegram';
+const BUILD = 'b20 · далекомір виправлено';
 
 const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
 
@@ -266,9 +267,12 @@ const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
    будь-який код, що не є серійником, — це і є Date Code. Саме зашитий
    префікс «CP» і був причиною того, що наведення мовчало на коробках CN. */
 function isDateCode(t){
-  const x = String(t || '');
-  return !RE_SERIAL.test(x.toUpperCase().replace(/O/g,'0'))
-         && x.length >= 12 && x.length <= 18;
+  const x = String(t || '').toUpperCase();
+  return !RE_SERIAL.test(x.replace(/O/g,'0'))
+         && x.length >= 12 && x.length <= 18
+         // EAN і UPC — суцільні цифри. Вони фізично коротші за S/N, тому
+         // і наведення, і далекомір по них давали хибні значення.
+         && /[A-Z]/.test(x);
 }
 
 const state = {
@@ -933,7 +937,7 @@ function stopCamera(){
   els.hint.hidden = true;
   els.live.hidden = true;
   els.gauge.className = 'gauge';
-  hint = null; hintLeft = 0;
+  hint = null; hintLeft = 0; steady = 0;
   pending.clear();
   els.stop.disabled = els.torch.disabled = true;
   els.off.querySelector('p').textContent = 'Камера вимкнена.';
@@ -989,6 +993,7 @@ function grabRoi(scale, bandIdx){
 const HINT_TTL = 14;                  // скільки кадрів тримати наведення
 let hint = null;                      // {yc, h} у пікселях кадру
 let hintLeft = 0;
+let steady = 0;                       // кадрів підряд без серійника
 
 function setHintFromDateCode(box, grab){
   const g = grab || lastGrab;
@@ -1038,16 +1043,35 @@ function grabHint(scale, boost){
 
 /* Далекомір: за шириною Date Code рахуємо, скільки пікселів на модуль
    випаде на S/N (211 модулів проти 255 за тієї ж друкованої ширини). */
+/* Далекомір.
+
+   Тут була помилка, через яку сканер просив «ближче» на цілком нормальній
+   відстані. Ширина ділилась на 255 модулів завжди, але 255 — це для S/N
+   (20 символів). Міряємо ж ми переважно по Date Code, у якого 16 символів
+   і лише 211 модулів. Він фізично КОРОТШИЙ (заміряно: 629 px проти 821 px
+   на тому самому кадрі), тому щільність виходила на 17% нижчою за справжню:
+   2.47 замість 2.98 при пороговому 2.4 — рівно на межі. Звідси й скарга
+   «кожен сьомий код хоче ближче, а ближче вже нема куди».
+
+   Правильно: модулів Code-128 = 11 на символ + 35 службових. Ширина
+   модуля на етикетці однакова для обох штрихкодів, тому щільність,
+   виміряна по Date Code, дійсна і для S/N. */
 function gauge(box, text){
   if (!box) return;
   const w = Math.abs(box.x1 - box.x0) / lastGrab.scale;
   if (!w) return;
-  // Date Code і S/N мають однакову друковану ширину, тому щільність
-  // майбутнього S/N рахуємо однаково для обох.
-  const pxPerModuleSN = w / 255;
-  if (pxPerModuleSN < 2.4){
+  const t = String(text || '');
+  if (t.length < 8) return;
+  const pxPerModule = w / (11*t.length + 35);
+
+  if (pxPerModule < 2.2){
     els.gauge.textContent = 'ближче';
     els.gauge.className = 'gauge near';
+  } else if (steady > 14){
+    // Відстань нормальна, а серійник усе одно не береться — майже завжди
+    // це змазування від руху. Водити камерою тут якраз шкідливо.
+    els.gauge.textContent = 'тримай нерухомо';
+    els.gauge.className = 'gauge hold';
   } else {
     els.gauge.textContent = 'відстань добра';
     els.gauge.className = 'gauge good';
@@ -1126,6 +1150,7 @@ async function loop(){
       state.lastOther = t; state.lastOtherBox = !!f.box;
     }
   }
+  steady = sawSerial ? 0 : steady + 1;
   if (sawSerial) hintLeft = Math.max(hintLeft, 4);
 
   if (state.frames % 10 === 0) renderDiag();
