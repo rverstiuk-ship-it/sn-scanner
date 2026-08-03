@@ -252,7 +252,7 @@
    ============================================================ */
 /* Позначка збірки. Видно в «Діагностиці» — так одразу зрозуміло, чи
    на телефоні справді свіжий файл, чи Safari віддає старий із кешу. */
-const BUILD = 'b16 · Date Code без префікса';
+const BUILD = 'b17 · нативний рушій у фоні';
 
 const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
 
@@ -286,7 +286,7 @@ const state = {
 let zbarReady = (typeof window.zbarWasm !== 'undefined');
 
 // Фоновий потік декодування; якщо не підніметься, все працює в основному
-let worker = null, workerReady = false, workerZbar = false, workerZxing = false;
+let worker = null, workerReady = false, workerZbar = false, workerZxing = false, workerNative = false;
 let reqId = 0;
 const pending = new Map();
 
@@ -401,6 +401,7 @@ function renderList(){
 function renderDiag(){
   const dec = [];
   if (workerReady){
+    if (workerNative) dec.push('native');
     if (workerZbar) dec.push('zbar');
     if (workerZxing) dec.push('zxing');
   } else {
@@ -651,7 +652,7 @@ const ZBAR_WASM = 'https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@0.11.0/dist/z
 const ZXING_JS  = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
 
 const WORKER_SRC = `
-let zbarOk = false, zbarScanner = null, zxingReader = null;
+let zbarOk = false, zbarScanner = null, zxingReader = null, nativeDet = null;
 
 try { importScripts('${ZBAR_JS}'); } catch (e) {}
 try { importScripts('${ZXING_JS}'); } catch (e) {}
@@ -689,7 +690,17 @@ try { importScripts('${ZXING_JS}'); } catch (e) {}
       zxingReader.setHints(hints);
     }
   }catch(e){}
-  postMessage({ type:'ready', zbar: zbarOk, zxing: !!zxingReader });
+  // Нативний детектор (ML Kit на Android, доступний і у воркері) —
+  // на щільних кодах він сильніший за обидві бібліотеки. У Safari його немає.
+  try{
+    if (self.BarcodeDetector){
+      const fmts = await self.BarcodeDetector.getSupportedFormats();
+      if (fmts.indexOf('code_128') >= 0){
+        nativeDet = new self.BarcodeDetector({ formats:['code_128'] });
+      }
+    }
+  }catch(e){}
+  postMessage({ type:'ready', zbar: zbarOk, zxing: !!zxingReader, native: !!nativeDet });
 })();
 
 function zxingOn(imgData){
@@ -761,7 +772,21 @@ self.onmessage = async (ev) => {
     m.bitmap.close();
     const imgData = cx.getImageData(0, 0, w, h);
 
-    results = await zbarOn(imgData);
+    // 1) нативний рушій — найсильніший там, де він є
+    if (nativeDet){
+      try{
+        const nf = await nativeDet.detect(oc);
+        for (const b of nf){
+          if (!b.rawValue) continue;
+          const bb = b.boundingBox;
+          results.push({ text:b.rawValue,
+            box: bb ? {x0:bb.x, x1:bb.x+bb.width, y0:bb.y, y1:bb.y+bb.height} : null });
+        }
+      }catch(e){}
+    }
+    // 2) ZBar
+    if (!hasSN(results)) results = results.concat(await zbarOn(imgData));
+    // 3) ZXing — найповільніший, тому за потреби
     if (!hasSN(results) && m.allowZxing){
       const x = zxingOn(imgData);
       if (x) results.push(x);
@@ -785,8 +810,8 @@ async function initWorker(){
         const m = ev.data;
         if (m.type === 'ready'){
           clearTimeout(t);
-          workerZbar = !!m.zbar; workerZxing = !!m.zxing;
-          resolve(m.zbar || m.zxing);
+          workerZbar = !!m.zbar; workerZxing = !!m.zxing; workerNative = !!m.native;
+          resolve(m.zbar || m.zxing || m.native);
         } else if (m.type === 'result'){
           const r = pending.get(m.id);
           if (r){ pending.delete(m.id); r(m.results || []); }
@@ -795,7 +820,7 @@ async function initWorker(){
       worker.onerror = ()=>{ clearTimeout(t); resolve(false); };
     });
     if (!ok){ try{ worker.terminate(); }catch(e){} worker = null; return false; }
-    log('фоновий потік: ' + (workerZbar?'zbar ':'') + (workerZxing?'zxing':''));
+    log('фоновий потік: ' + (workerNative?'native ':'') + (workerZbar?'zbar ':'') + (workerZxing?'zxing':''));
     return true;
   }catch(e){
     log('фоновий потік не піднявся: '+e.message);
