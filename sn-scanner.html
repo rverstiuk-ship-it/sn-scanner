@@ -186,7 +186,7 @@
   </div>
 
   <div class="row">
-    <button id="shotBtn">Зняти фото (якщо не бере)</button>
+    <button id="shotBtn">Зняти фото → в Telegram</button>
   </div>
   <input type="file" accept="image/*" capture="environment" id="shot" hidden>
 
@@ -215,7 +215,7 @@
   <fieldset>
     <legend>Партія та надсилання</legend>
     <label for="who">Хто сканує <span style="color:var(--alert)">обов'язково</span></label>
-    <input id="who" placeholder="ім'я" autocomplete="off" autocapitalize="words">
+    <input id="who" placeholder="напр. Марія" autocomplete="off" autocapitalize="words">
     <label for="batch">Назва партії</label>
     <input id="batch" placeholder="напр. LANDWEST PF/1/1605/2025" autocomplete="off">
     <label for="expect">Скільки коробок очікується</label>
@@ -252,7 +252,7 @@
    ============================================================ */
 /* Позначка збірки. Видно в «Діагностиці» — так одразу зрозуміло, чи
    на телефоні справді свіжий файл, чи Safari віддає старий із кешу. */
-const BUILD = 'b17 · нативний рушій у фоні';
+const BUILD = 'b19 · фото в Telegram';
 
 const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
 
@@ -276,6 +276,7 @@ const state = {
   seq: 0,
   otherCodes: 0,
   hints: 0,
+  photos: 0,            // скільки знімків відправлено на ручну обробку
   lastOther: '',        // останній не-серійник — щоб бачити, що саме ловиться
   lastOtherBox: false,  // і чи прийшли з ним координати
   frames: 0,
@@ -318,6 +319,14 @@ function restore(){
   ['who','batch','expect'].forEach(k=>{
     const v = store.get(k, ''); if (v) els[k].value = v;
   });
+  // Порожня назва партії давала в таблиці «без назви». Підставляємо
+  // сьогоднішню дату — видно одразу, за потреби людина перепише.
+  if (!els.batch.value.trim()){
+    const d = new Date();
+    const p2 = n => String(n).padStart(2,'0');
+    els.batch.value = p2(d.getDate())+'.'+p2(d.getMonth()+1)+'.'+d.getFullYear();
+    store.set('batch', els.batch.value);
+  }
   renderAll();
 }
 ['who','batch','expect'].forEach(k=>{
@@ -1171,51 +1180,6 @@ function showEndpointInfo(){
     : '⚠️ Прошита адреса неправильна — виправ константу ENDPOINT у файлі.';
 }
 
-/* Відкриває адресу в прихованій рамці звичайним GET. Прочитати відповідь
-   Safari не дасть, але запит долетить і залишить рядок в аркуші «_Лог» —
-   так видно, чи саме ЦЯ збережена адреса робоча. */
-els.ping.addEventListener('click', ()=>{
-  persist();
-  // нова вкладка, а не перехід — інакше сканер опиниться в пісочниці скрипта
-  window.open(ENDPOINT + '?ping=1', '_blank');
-  els.sendMsg.textContent = 'Відкрив перевірку в новій вкладці. Якщо там сторінка «ПРИЙНЯТО» — канал робочий.';
-});
-
-
-function sendViaHiddenForm(url, payloadStr){
-  return new Promise(resolve=>{
-    const name = 'snsink_' + Date.now();
-    const ifr = document.createElement('iframe');
-    ifr.name = name;
-    ifr.setAttribute('aria-hidden','true');
-    ifr.style.cssText = 'position:absolute;left:-9999px;width:0;height:0;border:0';
-    document.body.appendChild(ifr);
-
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = url;
-    form.target = name;
-    form.enctype = 'application/x-www-form-urlencoded';
-    form.style.display = 'none';
-    const inp = document.createElement('input');
-    inp.type = 'hidden';
-    inp.name = 'payload';
-    inp.value = payloadStr;
-    form.appendChild(inp);
-    document.body.appendChild(form);
-
-    let done = false;
-    const finish = ok => {
-      if (done) return;
-      done = true;
-      setTimeout(()=>{ try{ form.remove(); ifr.remove(); }catch(e){} }, 800);
-      resolve(ok);
-    };
-    ifr.addEventListener('load', ()=> finish(true));
-    setTimeout(()=> finish(true), 12000);
-    form.submit();
-  });
-}
 /* Надсилання. КРИТИЧНО: усе робиться СИНХРОННО, прямо в обробнику дотику.
 
    Раніше тут спершу викликався fetch, і лише коли він падав — відкривалась
@@ -1229,8 +1193,13 @@ function sendViaHiddenForm(url, payloadStr){
    форма — єдиний канал, який проходить скрізь. */
 els.send.addEventListener('click', ()=>{
   if (!state.serials.size){ els.sendMsg.textContent='Спершу відскануй хоч один серійник.'; return; }
-  if (!els.who.value.trim()){
-    els.sendMsg.textContent = 'Впиши, хто сканує — без цього не видно, чий це прийом.';
+  const whoVal = els.who.value.trim();
+  // У журналі вже траплялось "who":"20" — людина вписала кількість коробок.
+  // Тому ім'я мусить бути хоч трохи схоже на ім'я.
+  if (!whoVal || /^\d+$/.test(whoVal) || whoVal.length < 2){
+    els.sendMsg.textContent = !whoVal
+      ? 'Впиши, хто сканує — без цього не видно, чий це прийом.'
+      : 'У полі «Хто сканує» має бути ім\'я, а не число. Кількість коробок — нижче.';
     els.who.style.borderColor = 'var(--alert)';
     els.who.focus();
     els.who.scrollIntoView({ block:'center', behavior:'smooth' });
@@ -1249,7 +1218,7 @@ els.send.addEventListener('click', ()=>{
     .map(([s,m])=>({ serial:s, seq:m.seq, src:m.src, flag:m.flag||'', ts:new Date(m.ts).toISOString() }));
 
   const payloadStr = JSON.stringify({
-    secret: SECRET, who: els.who.value.trim(), batch: els.batch.value.trim(),
+    secret: SECRET, who: whoVal, batch: els.batch.value.trim(),
     expected: parseInt(els.expect.value,10) || null,
     count: rows.length, serials: rows
   });
@@ -1291,125 +1260,102 @@ els.send.addEventListener('click', ()=>{
   setTimeout(()=>{ try{ form.remove(); }catch(e){} }, 3000);
 });
 
-/* ---------- Резерв: повнорозмірний знімок ----------
-   Нативна камера віддає ~4032 px проти 2160 px у прямому потоці, тобто
-   майже вдвічі більше пікселів на модуль, плюс кращий автофокус.
-   Тут ми не обмежені швидкістю, тому перебираємо смуги й масштаби. */
+/* ---------- Фото проблемної коробки в Telegram ----------
+   Кнопка НЕ розпізнає знімок. Її задача інша: коробку, яку сканер не бере,
+   треба швидко відкласти на ручну обробку. Тому фото просто йде в групу
+   з підписом — хто, яка партія, коли.
+
+   Знімок стискаємо до 2400 px по довшій стороні: цього з головою для
+   читання серійника оком, а розмір лишається розумним для мобільної мережі.
+   Надсилаємо як ДОКУМЕНТ, а не фото — Telegram інакше перестиснув би
+   картинку до 1280 px, і дрібний текст під штрихкодом став би нечитабельним. */
+
+async function shrinkToJpeg(file, maxSide, quality){
+  const bmp = await createImageBitmap(file);
+  let w = bmp.width, h = bmp.height;
+  const k = Math.min(1, maxSide / Math.max(w, h));
+  w = Math.round(w*k); h = Math.round(h*k);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const cx = c.getContext('2d');
+  cx.drawImage(bmp, 0, 0, w, h);
+  try{ bmp.close(); }catch(e){}
+  return { dataUrl: c.toDataURL('image/jpeg', quality), w: w, h: h };
+}
+
 els.shotBtn.addEventListener('click', ()=> els.shot.click());
 
 els.shot.addEventListener('change', async ()=>{
   const f = els.shot.files && els.shot.files[0];
   if (!f) return;
+
+  const whoVal = els.who.value.trim();
+  if (!whoVal || /^\d+$/.test(whoVal) || whoVal.length < 2){
+    els.sendMsg.textContent = 'Спершу впиши, хто сканує — це піде в підпис до фото.';
+    els.who.style.borderColor = 'var(--alert)';
+    els.who.focus();
+    els.who.scrollIntoView({ block:'center', behavior:'smooth' });
+    fbWarn();
+    setTimeout(()=>{ els.who.style.borderColor=''; }, 2500);
+    els.shot.value = '';
+    return;
+  }
+
+  // Вкладку відкриваємо ОДРАЗУ, поки дозвіл від дотику ще діє — стискання
+  // фото займає час, і після нього браузер уже заблокував би нову вкладку.
+  let win = null;
+  try{ win = window.open('about:blank', 'snphoto'); }catch(e){}
+  if (win){
+    try{
+      win.document.write('<body style="margin:0;padding:26px;background:#17172A;'
+        + 'color:#F2F5F5;font-family:-apple-system,system-ui,sans-serif">'
+        + 'Готую фото…</body>');
+    }catch(e){}
+  }
+
   els.shotBtn.disabled = true;
-  els.shotBtn.textContent = 'Обробляю знімок…';
+  els.shotBtn.textContent = 'Стискаю знімок…';
   try{
-    const bmp = await createImageBitmap(f);
-    const found = await decodeStill(bmp);
-    if (found){
-      add(found, 'фото');
-    } else {
-      els.last.textContent = '— на знімку S/N не знайдено —';
-      els.last.classList.add('empty');
-      els.lastTag.innerHTML = '<span class="tag t-dup">спробуй ближче або з ліхтарем</span>';
-      fbWarn();
-    }
+    const img = await shrinkToJpeg(f, 2400, 0.88);
+    const b64 = img.dataUrl.split(',')[1];
+    log('фото '+img.w+'×'+img.h+' · '+Math.round(b64.length/1024)+' КБ');
+
+    const form = document.createElement('form');
+    form.method  = 'POST';
+    form.action  = ENDPOINT;
+    form.enctype = 'application/x-www-form-urlencoded';
+    form.style.display = 'none';
+    const put = (n, v) => {
+      const i = document.createElement('input');
+      i.type = 'hidden'; i.name = n; i.value = v;
+      form.appendChild(i);
+    };
+    put('secret', SECRET);
+    put('mode', 'photo');
+    put('photo', b64);
+    put('who', whoVal);
+    put('batch', els.batch.value.trim());
+    put('nav', '1');
+    if (win){ form.target = 'snphoto'; put('back',''); }
+    else    { form.target = '_self';   put('back', location.href.split('#')[0]); }
+
+    document.body.appendChild(form);
+    form.submit();
+    setTimeout(()=>{ try{ form.remove(); }catch(e){} }, 3000);
+
+    state.photos++;
+    els.sendMsg.textContent = 'Фото № '+state.photos+' пішло в Telegram на ручну обробку.';
+    fbNew();
   }catch(e){
-    log('знімок: '+e.message);
+    els.sendMsg.textContent = 'Не вдалося підготувати фото: '+e.message;
+    log('фото: '+e.message);
+    fbWarn();
   }finally{
     els.shot.value = '';
     els.shotBtn.disabled = false;
-    els.shotBtn.textContent = 'Зняти фото (якщо не бере)';
+    els.shotBtn.textContent = 'Зняти фото → в Telegram';
   }
 });
-
-/* Обробка повнорозмірного знімка (~3024×4032 проти 2160×3840 у прямому
-   потоці, плюс нормальний автофокус нативної камери).
-
-   Попередня версія читала спершу весь кадр цілком — 12 млн пікселів за
-   одне getImageData, і ще двічі по 12 смуг. Разом близько 100 млн
-   пікселів: Safari на телефоні або висне, або тихо валиться. Тому тепер:
-
-   1) смуги помірної висоти в нативній роздільності — шукаємо БУДЬ-ЯКІ коди;
-   2) якщо трапився Date Code — рахуємо за ним, де S/N (стало 2.0 висоти
-      нижче), вирізаємо тільки цю смугу й збільшуємо втричі;
-   3) якщо Date Code не знайшовся — проходимо смуги ще раз подвоєними.
-
-   Тут ми не обмежені швидкістю, тому можна дозволити собі точну роботу. */
-async function decodeStill(bmp){
-  const W = bmp.width, H = bmp.height;
-  log('знімок '+W+'×'+H);
-  const c = document.createElement('canvas');
-  const cx = c.getContext('2d', {willReadFrequently:true});
-
-  const draw = (sy, sh, scale) => {
-    c.width  = Math.round(W*scale);
-    c.height = Math.round(sh*scale);
-    cx.imageSmoothingEnabled = false;
-    cx.drawImage(bmp, 0, sy, W, sh, 0, 0, c.width, c.height);
-  };
-  const pickSerial = list => {
-    for (const f of (list || [])){
-      const cl = classify(f.text);
-      if (cl.ok) return cl.s;
-    }
-    return null;
-  };
-  const findDateCode = list => {
-    for (const f of (list || [])){
-      if (isDateCode(f.text) && f.box) return f.box;
-    }
-    return null;
-  };
-
-  const bandH = Math.round(H*0.12);
-  const step  = Math.round(bandH*0.5);
-
-  // 1) прохід смугами в нативній роздільності
-  let dc = null, dcTop = 0;
-  for (let top = 0; top + bandH <= H; top += step){
-    els.shotBtn.textContent = 'Шукаю… ' + Math.round(top/H*100) + '%';
-    draw(top, bandH, 1);
-    const found = await decodeCanvas(c, true);
-    const sn = pickSerial(found);
-    if (sn) return sn;
-    if (!dc){
-      const box = findDateCode(found);
-      if (box){ dc = box; dcTop = top; }
-    }
-    await new Promise(r => setTimeout(r, 0));   // даємо браузеру дихати
-  }
-
-  // 2) знайшли Date Code — цілимось точно в S/N під ним і збільшуємо
-  if (dc){
-    const cpYc = dcTop + (dc.y0 + dc.y1)/2;
-    const cpH  = Math.abs(dc.y1 - dc.y0);
-    const snYc = cpYc + 2.0*cpH;
-    const snH  = Math.max(cpH*2.6, 90);
-    let sy = Math.round(snYc - snH/2), sh = Math.round(snH);
-    if (sy < 0){ sh += sy; sy = 0; }
-    if (sy + sh > H) sh = H - sy;
-    if (sh > 20){
-      log('наведення по Date Code: смуга '+sy+'..'+(sy+sh));
-      for (const sc of [3, 2]){
-        els.shotBtn.textContent = 'Уточнюю…';
-        draw(sy, sh, sc);
-        const sn = pickSerial(await decodeCanvas(c, true));
-        if (sn) return sn;
-        await new Promise(r => setTimeout(r, 0));
-      }
-    }
-  }
-
-  // 3) запасний прохід — ті самі смуги подвоєними
-  for (let top = 0; top + bandH <= H; top += step){
-    els.shotBtn.textContent = 'Ще раз… ' + Math.round(top/H*100) + '%';
-    draw(top, bandH, 2);
-    const sn = pickSerial(await decodeCanvas(c, true));
-    if (sn) return sn;
-    await new Promise(r => setTimeout(r, 0));
-  }
-  return null;
-}
 
 function log(m){ els.log.textContent = (m+'\n'+els.log.textContent).slice(0,900); }
 
