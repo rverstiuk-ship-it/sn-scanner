@@ -253,7 +253,7 @@
    ============================================================ */
 /* Позначка збірки. Видно в «Діагностиці» — так одразу зрозуміло, чи
    на телефоні справді свіжий файл, чи Safari віддає старий із кешу. */
-const BUILD = 'b21 · економний темп';
+const BUILD = 'b22 · смуга під нахил';
 
 const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
 
@@ -430,6 +430,7 @@ function renderDiag(){
     + ' · ROI: '+lastRoi
     + ' · темп: '+lastDelay+'мс'
     + ' · наведень: '+state.hints
+    + (lastTilt ? ' · нахил ~'+lastTilt+'°' : '')
     + (state.lastOther ? ' · сторонній: '+state.lastOther.slice(0,18)
         + (state.lastOtherBox ? ' +коорд' : ' БЕЗ КООРД') : '')
     + (canFilter ? ' · контраст є' : '')
@@ -470,6 +471,7 @@ let nativeDetector = null;
 let zxingReader = null;
 let lastRoi = '—';
 let lastDelay = 0;
+let lastTilt = 0;                     // визначений нахил етикетки, градуси
 
 /* Налаштування ZBar. Три речі, які за замовчуванням працюють проти нас:
 
@@ -939,7 +941,7 @@ function stopCamera(){
   els.hint.hidden = true;
   els.live.hidden = true;
   els.gauge.className = 'gauge';
-  hint = null; hintLeft = 0; steady = 0; lastSeenTs = 0;
+  hint = null; hintLeft = 0; steady = 0; lastSeenTs = 0; lastTilt = 0;
   pending.clear();
   els.stop.disabled = els.torch.disabled = true;
   els.off.querySelector('p').textContent = 'Камера вимкнена.';
@@ -1012,14 +1014,36 @@ const CADENCE = { lock: 40, hunt: 70, idle: 200, afterHit: 500 };
 function setHintFromDateCode(box, grab){
   const g = grab || lastGrab;
   if (box){
-    // Точне наведення: знаємо, де саме Date Code, а S/N рівно за 2.0 його
-    // висоти нижче (виміряно на двох коробках).
-    const cpYc = g.sy + (box.y0 + box.y1) / 2 / g.scale;
-    const cpH  = Math.abs(box.y1 - box.y0) / g.scale;
-    if (cpH >= 8){
-      hint = { yc: cpYc + 2.0 * cpH, h: Math.max(cpH * 2.4, 70) };
+    const w  = Math.abs(box.x1 - box.x0) / g.scale;   // ширина рамки Date Code
+    const hb = Math.abs(box.y1 - box.y0) / g.scale;   // її висота
+    const yc = g.sy + (box.y0 + box.y1) / 2 / g.scale;
+
+    if (w > 40 && hb >= 6){
+      /* Смуга має бути такою, щоб хоч один горизонтальний рядок перетнув
+         S/N ЦІЛКОМ — від старт-патерну до стоп-патерну. Якщо етикетка
+         нахилена, штрихкод іде через смугу по діагоналі, і вузька смуга
+         його розрізає: жоден рядок не проходить наскрізь. Саме тому
+         сканер брав лише коли камеру тримали строго прямо.
+
+         Нахил вимірюємо по самому Date Code. Ненахилений штрихкод має
+         висоту приблизно 0.13 своєї ширини; усе, що вище — приріст від
+         нахилу. S/N довший за Date Code приблизно в 1.31 раза (заміряно:
+         821 px проти 629 px), тому в нього той самий нахил дає більший
+         вертикальний розліт. */
+      const barH   = Math.min(hb, Math.max(w * 0.13, 10));  // власна висота смуг
+      const rise   = Math.max(0, hb - barH);                // приріст від нахилу
+      const snRise = rise * 1.31;                           // у S/N він більший
+      const vh     = els.vid.videoHeight || 0;
+
+      let h = barH * 2.0 + snRise * 1.4;
+      h = Math.max(h, 90);
+      if (vh) h = Math.min(h, vh * 0.42);   // щоб смуга не з'їла весь кадр
+
+      hint = { yc: yc + 2.0 * barH, h: h };
       if (hintLeft === 0) state.hints++;
       hintLeft = HINT_TTL;
+      lastTilt = rise > 0 && w > 0
+        ? Math.round(Math.asin(Math.min(1, rise / w)) * 180 / Math.PI) : 0;
       return;
     }
   }
