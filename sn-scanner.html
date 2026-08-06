@@ -253,7 +253,7 @@
    ============================================================ */
 /* Позначка збірки. Видно в «Діагностиці» — так одразу зрозуміло, чи
    на телефоні справді свіжий файл, чи Safari віддає старий із кешу. */
-const BUILD = 'b20 · далекомір виправлено';
+const BUILD = 'b21 · економний темп';
 
 const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
 
@@ -428,6 +428,7 @@ function renderDiag(){
     + ' · декодери: '+(dec.join('+') || 'НЕМАЄ')
     + (workerReady ? ' у фоні' : ' в основному потоці')
     + ' · ROI: '+lastRoi
+    + ' · темп: '+lastDelay+'мс'
     + ' · наведень: '+state.hints
     + (state.lastOther ? ' · сторонній: '+state.lastOther.slice(0,18)
         + (state.lastOtherBox ? ' +коорд' : ' БЕЗ КООРД') : '')
@@ -468,6 +469,7 @@ els.manual.addEventListener('keydown', e=>{ if(e.key==='Enter') els.addManual.cl
 let nativeDetector = null;
 let zxingReader = null;
 let lastRoi = '—';
+let lastDelay = 0;
 
 /* Налаштування ZBar. Три речі, які за замовчуванням працюють проти нас:
 
@@ -937,7 +939,7 @@ function stopCamera(){
   els.hint.hidden = true;
   els.live.hidden = true;
   els.gauge.className = 'gauge';
-  hint = null; hintLeft = 0; steady = 0;
+  hint = null; hintLeft = 0; steady = 0; lastSeenTs = 0;
   pending.clear();
   els.stop.disabled = els.torch.disabled = true;
   els.off.querySelector('p').textContent = 'Камера вимкнена.';
@@ -994,6 +996,18 @@ const HINT_TTL = 14;                  // скільки кадрів трима�
 let hint = null;                      // {yc, h} у пікселях кадру
 let hintLeft = 0;
 let steady = 0;                       // кадрів підряд без серійника
+let lastSeenTs = 0;                   // коли востаннє щось узагалі знайшли
+
+/* Темп роботи. Раніше стояв один інтервал 25 мс — а оскільки саме
+   декодування триває 40-60 мс, сканер працював взагалі без пауз, на
+   100% завантаження процесора. Звідси і перегрів телефона.
+
+   Тепер темп залежить від того, чи є на що дивитись:
+     lock  — активне наведення на етикетку, потрібна швидкість
+     hunt  — етикетку щойно бачили, тримаємо готовність
+     idle  — у кадрі нічого немає (людина йде між коробками)
+   В idle сканер працює вп'ятеро рідше й пропускає найдорожчі спроби. */
+const CADENCE = { lock: 40, hunt: 70, idle: 200, afterHit: 500 };
 
 function setHintFromDateCode(box, grab){
   const g = grab || lastGrab;
@@ -1091,7 +1105,15 @@ async function tryDecode(geom, scale, boost, allowZxing){
 
 async function loop(){
   if (!state.running) return;
+
+  // Вкладка не на екрані — не гріємо процесор даремно
+  if (document.hidden){
+    rafTimer = setTimeout(loop, 600);
+    return;
+  }
+
   state.frames++; tick++;
+  const idle = (Date.now() - lastSeenTs) > 3000;   // у кадрі давно нічого немає
 
   let found = [];
 
@@ -1102,7 +1124,9 @@ async function loop(){
     if (g){
       g.hintMode = true;
       found = await tryDecode(g, 2, false, true);
-      if (!hasSerial(found) && (canFilter || workerReady)){
+      // Контрастний варіант — це другий повний прохід декодування, тобто
+      // подвоєна ціна кадру. Робимо через раз, а в економному режимі — ні.
+      if (!hasSerial(found) && (canFilter || workerReady) && !idle && (tick % 2 === 0)){
         found = found.concat(await tryDecode(g, 2, true, true));
       }
     }
@@ -1111,13 +1135,17 @@ async function loop(){
   // 2. Інакше — перебір смуг по кадру
   if (!hasSerial(found)){
     const bandIdx = tick % ROI_BANDS.length;
-    const heavy = (tick % 4 === 0);
+    // ZXing на JS — найдорожчий рушій. Там, де є нативний, він зайвий;
+    // в економному режимі не запускаємо його взагалі.
+    const heavy = !idle && !(workerNative || nativeDetector) && (tick % 4 === 0);
     const g = roiGeom(bandIdx); g.bandIdx = bandIdx;
     const r = await tryDecode(g, 1, false, heavy);
     found = found.concat(r);
 
-    // 3. Трапився Date Code — наводимось і пробуємо S/N ОДРАЗУ
-    if (!hasSerial(found)){
+    // 3. Трапився Date Code — наводимось і пробуємо S/N ОДРАЗУ.
+    //    В економному режимі цю додаткову спробу пропускаємо: етикетка
+    //    щойно з'явилась, наступний кадр буде вже у швидкому темпі.
+    if (!hasSerial(found) && !idle){
       for (const f of r){
         if (isDateCode(f.text)){
           setHintFromDateCode(f.box, lastGrab);
@@ -1151,12 +1179,17 @@ async function loop(){
     }
   }
   steady = sawSerial ? 0 : steady + 1;
+  if (found.length) lastSeenTs = Date.now();
   if (sawSerial) hintLeft = Math.max(hintLeft, 4);
 
   if (state.frames % 10 === 0) renderDiag();
 
-  // у фоновому режимі головний потік вільний, тому можна частіше
-  rafTimer = setTimeout(loop, hit ? 500 : (workerReady ? 25 : 50));
+  const delay = hit            ? CADENCE.afterHit
+              : hintLeft > 0   ? CADENCE.lock
+              : !idle          ? CADENCE.hunt
+              :                  CADENCE.idle;
+  lastDelay = delay;
+  rafTimer = setTimeout(loop, delay);
 }
 
 /* ---------- Ліхтар ---------- */
