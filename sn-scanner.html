@@ -209,7 +209,7 @@
   <fieldset>
     <legend>Ввести вручну</legend>
     <input id="manual" placeholder="1581F7K3C…" inputmode="latin" autocapitalize="characters" autocomplete="off" spellcheck="false">
-    <p class="hint">Для коробки, яку не вдається відсканувати. Формат перевіряється так само.</p>
+    <p class="hint" id="manualHint">Для коробки, яку не вдається відсканувати. Формат перевіряється так само.</p>
     <div class="row" style="margin-top:10px"><button id="addManual">Додати</button></div>
   </fieldset>
 
@@ -253,7 +253,7 @@
    ============================================================ */
 /* Позначка збірки. Видно в «Діагностиці» — так одразу зрозуміло, чи
    на телефоні справді свіжий файл, чи Safari віддає старий із кешу. */
-const BUILD = 'b22 · смуга під нахил';
+const BUILD = 'b23 · ручне поле ловить склеєні скани';
 
 const RE_SERIAL = /^1581[0-9A-Z]{16}$/;
 
@@ -459,6 +459,44 @@ els.addManual.addEventListener('click', ()=>{
   els.manual.value='';
 });
 els.manual.addEventListener('keydown', e=>{ if(e.key==='Enter') els.addManual.click(); });
+
+/* Апаратний сканер (Sunmi, режим Keystroke) може не надіслати Enter —
+   тоді скани злипаються в один рядок. Тому ловимо серійники прямо на input. */
+const RE_SERIAL_ANY = /1581[0-9A-Z]{16}/g;   // O теж у класі — add() сам виправить O→0
+const MANUAL_IDLE_MS = 300;
+const manualHintText = $('manualHint').textContent;
+let manualIdle = null, manualHintTimer = null;
+function manualNotSerial(){
+  els.manual.value = '';
+  els.manual.style.borderColor = 'var(--alert)';
+  $('manualHint').textContent = 'не серійник';
+  state.otherCodes++; renderDiag();
+  fbWarn();
+  clearTimeout(manualHintTimer);
+  manualHintTimer = setTimeout(()=>{
+    els.manual.style.borderColor = '';
+    $('manualHint').textContent = manualHintText;
+  }, 1500);
+}
+els.manual.addEventListener('input', ()=>{
+  clearTimeout(manualIdle);
+  const u = els.manual.value.toUpperCase().replace(/[^0-9A-Z]/g,'');
+  let lastEnd = -1, m;
+  RE_SERIAL_ANY.lastIndex = 0;
+  while ((m = RE_SERIAL_ANY.exec(u))){
+    add(m[0], 'вручну');
+    lastEnd = m.index + m[0].length;
+  }
+  // Лишаємо тільки хвіст після останнього серійника — це може бути початок наступного скану
+  if (lastEnd >= 0) els.manual.value = u.slice(lastEnd);
+  const rest = lastEnd >= 0 ? u.slice(lastEnd) : u;
+  if (!rest) return;
+  manualIdle = setTimeout(()=>{
+    const v = els.manual.value.toUpperCase().replace(/[^0-9A-Z]/g,'');
+    // "1", "15", "158" — людина ще друкує префікс; з "1581" — чекаємо решту/Enter
+    if (v && !v.includes('1581') && !'1581'.startsWith(v)) manualNotSerial();
+  }, MANUAL_IDLE_MS);
+});
 
 /* ============================================================
    ДЕКОДЕР
